@@ -1,0 +1,12 @@
+name: agent-dispatch
+version: 1.1.0
+description: "Dispatch tasks to other Hermes profiles via their API servers. Async (fire-and-forget with SSE auto-delivery), sync (session-persistent multi-turn), and in-process subagent delegation with per-call model selection."
+author: Ben
+provides_tools:
+  - dispatch_agent
+  - check_dispatch
+  - collect_dispatches
+  - dispatch_status
+  - dispatch_chat
+  - cancel_dispatch
+  - delegate_subagent

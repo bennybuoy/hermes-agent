@@ -850,36 +850,19 @@ def _valid_lockfile_payload(parsed: object, ownership_id: str) -> bool:
 def _lock_owned_serve_pids(base_dir: Path | None = None) -> set[int]:
     """PIDs claimed as owners by valid ``backend.lock.json`` records on this host.
 
-    Scans ``{hermes_root}/desktop-ssh/<ownershipId>/backend.lock.json`` (the
+    Scans ``{hermes_home}/desktop-ssh/<ownershipId>/backend.lock.json`` (the
     same directory the Desktop SSH runtime writes to). Any PID a valid lock
     names is a legitimately-owned backend — including backends another client
     or machine started over SSH — and must be spared by the orphan reap.
-
-    The scan anchors to the machine root (``get_default_hermes_root()``), NOT
-    the possibly profile-scoped ``HERMES_HOME`` this process runs under. The
-    lock writer (``windows_ssh_runtime._root()``) deliberately anchors both
-    processes to the machine root "so a named profile cannot move the reader
-    away"; the reap must read from the same place. A profile-mode backend
-    (``hermes --profile ruby serve --isolated``) otherwise scans a
-    nonexistent ``<profile-home>/desktop-ssh/``, finds zero owned PIDs, and
-    kills every live sibling backend started by other Desktop windows —
-    the multi-window takedown regression (atrium-agents 2026-08-29).
 
     Best-effort: any read/parse/IO error for a single record is swallowed and
     that record contributes no PID. Never raises.
     """
     import json
 
-    if base_dir is not None:
-        root = base_dir
-    else:
-        try:
-            from hermes_constants import get_default_hermes_root
-
-            scan_root = get_default_hermes_root()
-        except Exception:
-            scan_root = _hermes_home_dir()
-        root = scan_root / _REMOTE_LOCK_SUBDIR
+    root = base_dir if base_dir is not None else (
+        _hermes_home_dir() / _REMOTE_LOCK_SUBDIR
+    )
     owned: set[int] = set()
     if not root.is_dir():
         return owned

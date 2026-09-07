@@ -84,6 +84,8 @@ _backend: Dict[str, ComputerUseBackend] = {}
 _backends: Dict[Tuple[str, str], ComputerUseBackend] = {}
 _backend_call_locks: Dict[Tuple[str, str], threading.RLock] = {}
 _backend_permission_modes: Dict[Tuple[str, str], str] = {}
+# A lock is also an ownership generation. Release revokes both its starter and queued waiters.
+_backend_start_locks: Dict[Tuple[str, str], threading.Lock] = {}
 _AUX_VISION_ROUTE_CACHE: Dict[Tuple[str, str], bool] = {}  # process-scoped: (provider, model) → bool
 # Approval state keyed by session_id so a gateway serving concurrent sessions can't leak one run's
 # "always approve" into another; callers without a session_id share "".
@@ -197,29 +199,48 @@ def _stop_backend(backend: ComputerUseBackend, call_lock: Optional[threading.RLo
 def _get_backend(session_id: str = "") -> ComputerUseBackend:
     sid = str(session_id or "")
     owner = _backend_owner_key(sid)
-    while True:
+    with _backend_lock:
+        start_lock = _backend_start_locks.setdefault(owner, threading.Lock())
+    with start_lock:
         with _backend_lock:
+            if _backend_start_locks.get(owner) is not start_lock:
+                raise RuntimeError("computer_use session released during backend startup")
             # Mode resolved under the cache lock; YOLO mutation never holds the approval lock while releasing it.
             permission_mode = _cua_permission_mode(sid)
             if sid == "" and owner[0] in _backend and owner not in _backends:
                 _install_backend(owner, _backend[owner[0]], permission_mode)
-            if (cached := _backends.get(owner)) is None:
-                backend = _new_backend(sid, permission_mode)
-                backend.start()  # under the cache lock: one backend per session; a concurrent toggle releases it
-                return _install_backend(owner, backend, permission_mode)
-            if _backend_permission_modes.get(owner, "standard") == permission_mode:
+            cached = _backends.get(owner)
+            if cached is not None and _backend_permission_modes.get(owner, "standard") == permission_mode:
                 return cached
-            # Cua's mode is immutable after daemon startup: a /yolo toggle replaces only this session's backend.
-            _, stale_lock = _detach_locked(owner)  # stopped outside the cache lock; the loop re-reads the mode first
-        _stop_backend(cached, stale_lock, lambda e: None)
+            # Mode replacement keeps this owner generation; only release revokes its authority.
+            _, stale_lock = _detach_locked(owner)
+        if cached is not None:
+            _stop_backend(cached, stale_lock, lambda e: None)
+            with _backend_lock:
+                if _backend_start_locks.get(owner) is not start_lock:
+                    raise RuntimeError("computer_use session released during backend startup")
+                permission_mode = _cua_permission_mode(sid)
+        backend = _new_backend(sid, permission_mode)
+        try:
+            backend.start()  # external factory/start work must never hold the process-global map lock
+        except BaseException:
+            _stop_backend(backend, None, lambda e: logger.debug("computer_use failed startup teardown: %s", e))
+            raise
+        with _backend_lock:
+            if _backend_start_locks.get(owner) is start_lock:
+                return _install_backend(owner, backend, permission_mode)
+        _stop_backend(backend, None, lambda e: logger.debug("computer_use stale startup teardown: %s", e))
+        raise RuntimeError("computer_use session released during backend startup")
 
 def release_computer_use_session(session_id: str) -> bool:
     """Release one session-owned backend (lifecycle seam for hosts/plugins); idempotent, True iff one was released.
     Cache entries are removed BEFORE stopping so new lookups cannot retain the stale target/ref namespace; approval
     state is cleared even without a backend."""
     sid = str(session_id or "")
+    owner = _backend_owner_key(sid)
     with _backend_lock:
-        backend, call_lock = _detach_locked(_backend_owner_key(sid))
+        _backend_start_locks.pop(owner, None)
+        backend, call_lock = _detach_locked(owner)
     with _approval_lock:
         _session_auto_approve.pop(sid, None), _always_allow.pop(sid, None)
     if backend is None:
@@ -244,6 +265,7 @@ def _shutdown_backend_atexit() -> None:
             unique.setdefault(id(backend), (backend, _backend_call_locks.get((home, ""))))
         _backend.clear()
         _backends.clear(), _backend_call_locks.clear(), _backend_permission_modes.clear()
+        _backend_start_locks.clear()
     with _approval_lock:
         _session_auto_approve.clear(), _always_allow.clear(), _escalation_warned.clear()
     for backend, call_lock in unique.values():

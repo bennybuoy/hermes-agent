@@ -1,6 +1,8 @@
 """Backend ownership follows the profile scope used by provider selection."""
 
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 
 import pytest
@@ -107,3 +109,88 @@ def test_other_profile_cannot_reuse_or_release_backend(owners, session_id):
         assert tool._get_backend(session_id) is backend_a
         assert tool.release_computer_use_session(session_id)
         assert backend_a.stopped
+
+
+def in_profile(home, operation, *args):
+    with profile(home):
+        return operation(*args)
+
+
+@pytest.mark.parametrize("blocked_stage", ["create", "start"])
+def test_slow_provider_does_not_block_another_owner(owners, monkeypatch, blocked_stage):
+    (home_a, home_b), (provider_a, provider_b) = owners
+    entered, proceed = threading.Event(), threading.Event()
+    backend_a = Backend()
+
+    def block():
+        entered.set()
+        assert proceed.wait(10), "test did not release the slow provider"
+
+    def create(sid, mode):
+        if blocked_stage == "create":
+            block()
+        return backend_a
+
+    if blocked_stage == "start":
+        backend_a.start = block
+    monkeypatch.setattr(provider_a, "create_backend", create)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        slow = pool.submit(in_profile, home_a, dispatch, "same-session")
+        try:
+            assert entered.wait(5)
+            pool.submit(in_profile, home_b, dispatch, "same-session").result(3)
+            assert pool.submit(in_profile, home_b, tool.release_computer_use_session, "same-session").result(3)
+            assert provider_b.created[0].stopped
+            assert not slow.done()
+        finally:
+            proceed.set()
+        slow.result(5)
+
+
+def test_release_fences_starter_and_queued_waiter(owners, monkeypatch):
+    (home_a, _), (provider_a, _) = owners
+    entered, proceed, queued = threading.Event(), threading.Event(), threading.Event()
+    stale, replacement = Backend(), Backend()
+    candidates = iter((stale, replacement))
+
+    def start():
+        entered.set()
+        assert proceed.wait(10), "test did not release stale startup"
+
+    class ObservedLock:
+        def __init__(self):
+            self.lock = threading.Lock()
+
+        def __enter__(self):
+            if self.lock.locked():
+                queued.set()
+            self.lock.acquire()
+            return self
+
+        def __exit__(self, *exc):
+            self.lock.release()
+
+    # Observe an actual waiter acquiring the old single-flight record, not a timing guess.
+    owner = (hermes_home_key(home_a), "same-session")
+    monkeypatch.setattr(tool, "_backend_start_locks", {owner: ObservedLock()}, raising=False)
+    stale.start = start
+    monkeypatch.setattr(provider_a, "create_backend", lambda sid, mode: next(candidates))
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        original = pool.submit(in_profile, home_a, tool._get_backend, "same-session")
+        try:
+            assert entered.wait(5)
+            waiter = pool.submit(in_profile, home_a, tool._get_backend, "same-session")
+            assert queued.wait(3), "waiter cannot reach its owner while startup holds the global lock"
+            pool.submit(in_profile, home_a, tool.release_computer_use_session, "same-session").result(3)
+            assert pool.submit(in_profile, home_a, tool._get_backend, "same-session").result(3) is replacement
+        finally:
+            proceed.set()
+        for future in (original, waiter):
+            with pytest.raises(RuntimeError, match="released"):
+                future.result(5)
+        assert stale.stopped
+        assert not replacement.stopped
+        with profile(home_a):
+            assert tool._get_backend("same-session") is replacement
+            assert tool.release_computer_use_session("same-session")
+            assert replacement.stopped

@@ -47,6 +47,7 @@ class FakeProvider(ComputerUseProvider):
 
     def create_backend(self, session_id, permission_mode):
         backend = MagicMock()
+        backend.list_apps.return_value = []
         self.created.append((session_id, permission_mode))
 
         return backend
@@ -240,6 +241,48 @@ class TestLifecycle:
 
         assert cu_tool.release_computer_use_session("s1") is True
         backend.stop.assert_called_once()
+
+
+@pytest.mark.parametrize("transition", ["unload", "replace"])
+def test_registry_ownership_changes_reach_real_dispatch(monkeypatch, tmp_path, transition):
+    from hermes_constants import hermes_home_key, set_hermes_home_override, reset_hermes_home_override
+
+    cu_tool.reset_backend_for_tests()
+    monkeypatch.delenv("HERMES_COMPUTER_USE_BACKEND", raising=False)
+    (tmp_path / "config.yaml").write_text("computer_use:\n  provider: foo\n")
+    scope = hermes_home_key(tmp_path)
+    token = set_hermes_home_override(tmp_path)
+    first, replacement = FakeProvider("foo"), FakeProvider("foo")
+    dormant = FakeProvider("dormant")
+
+    def dispatch(sid):
+        return json.loads(cu_tool.handle_computer_use({"action": "list_apps"}, session_id=sid))
+
+    # Real provider selection and dispatch; only the desktop itself is a recording stub.
+    register_provider(first, scope=scope)
+    register_provider(dormant, scope=scope)
+    try:
+        assert "error" not in dispatch("before")
+        if transition == "unload":
+            assert restore_registration("foo", first, None, scope=scope)
+            result = dispatch("after")
+            assert "foo" in result["error"]
+            assert "hint" not in result
+        else:
+            register_provider(replacement, scope=scope)
+            assert "error" not in dispatch("after")
+            assert [sid for sid, _ in replacement.created] == ["after"]
+        assert [sid for sid, _ in first.created] == ["before"]
+        cu_tool._shutdown_backend_atexit()
+        assert first.cleaned == 1  # displaced providers can still own leases
+        assert replacement.cleaned == (1 if transition == "replace" else 0)
+        assert dormant.cleaned == 0
+    finally:
+        cu_tool.reset_backend_for_tests()
+        restore_registration("foo", replacement, None, scope=scope)
+        restore_registration("foo", first, None, scope=scope)
+        restore_registration("dormant", dormant, None, scope=scope)
+        reset_hermes_home_override(token)
 
 
 class TestAvailabilityGate:

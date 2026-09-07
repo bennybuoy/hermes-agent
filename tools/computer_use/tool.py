@@ -126,7 +126,8 @@ def _cua_permission_mode(session_id: str) -> str:
 _provider_lock = threading.Lock()
 # Keyed by profile home, not one slot: under gateway.multiplex_profiles a single process serves several
 # profiles, and computer_use.provider is read from each one's own config.yaml.
-_provider_cache: Dict[str, ComputerUseProvider] = {}
+_provider_cache: Dict[str, str] = {}  # configured names, never registry-owned objects
+_resolved_providers: Dict[int, ComputerUseProvider] = {}  # includes displaced providers with live leases
 
 def _configured_provider_name() -> str:
     """Read ``computer_use.provider``, bridging the retired env override.
@@ -148,14 +149,15 @@ def _configured_provider_name() -> str:
         return ""
 
 def active_computer_use_provider() -> ComputerUseProvider:
-    """The provider servicing this process, resolved once per profile (config cannot change mid-process; this is
-    read on every dispatch and tool-registration pass). ``reset_backend_for_tests`` clears it. Raises
+    """Keep configuration fixed per profile, but resolve its name through the current scoped registry.
+    Plugin unload/replacement must affect the next backend creation. Raises
     :class:`UnknownComputerUseProvider` for an unregistered name — see the registry on why that is not a fallback."""
     key = hermes_home_key()
     with _provider_lock:
-        if (cached := _provider_cache.get(key)) is not None:
-            return cached
-        provider = _provider_cache[key] = resolve_provider(_configured_provider_name())
+        if key not in _provider_cache:
+            _provider_cache[key] = _configured_provider_name()
+        provider = resolve_provider(_provider_cache[key])
+        _resolved_providers[id(provider)] = provider
         return provider
 
 def _new_backend(sid: str, permission_mode: str) -> ComputerUseBackend:
@@ -249,7 +251,7 @@ def _shutdown_backend_atexit() -> None:
     # After the backends: a provider's leases (containers, sandboxes) outlive the backend objects that drove
     # them. Only a provider we actually resolved can own anything, so this never forces a resolution at exit.
     with _provider_lock:
-        resolved = list(_provider_cache.values())
+        resolved = list(_resolved_providers.values())
     for provider in resolved:
         try:
             provider.emergency_cleanup()
@@ -260,6 +262,7 @@ def reset_backend_for_tests() -> None:  # pragma: no cover — tear down the cac
     _shutdown_backend_atexit()
     with _provider_lock:
         _provider_cache.clear()
+        _resolved_providers.clear()
     _AUX_VISION_ROUTE_CACHE.clear()
 
 def _noop_stub(name: str, *params: str, result: Any = None):

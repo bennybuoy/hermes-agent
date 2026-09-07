@@ -79,10 +79,11 @@ def _input_target_mismatch(backend, requested_app: str) -> Optional[str]:
 # ── Backend selection — env-swappable for tests ─────────────────────────────
 # Per-Hermes-session cached backends (own cua-driver session, native target, refs, grant namespace).
 _backend_lock = threading.Lock()
-_backend: Optional[ComputerUseBackend] = None  # backward-compatible empty-session injection hook (older tests)
-_backends: Dict[str, ComputerUseBackend] = {}
-_backend_call_locks: Dict[str, threading.RLock] = {}
-_backend_permission_modes: Dict[str, str] = {}
+# Empty-session injection is profile-qualified too; an unowned scalar cannot be routed safely.
+_backend: Dict[str, ComputerUseBackend] = {}
+_backends: Dict[Tuple[str, str], ComputerUseBackend] = {}
+_backend_call_locks: Dict[Tuple[str, str], threading.RLock] = {}
+_backend_permission_modes: Dict[Tuple[str, str], str] = {}
 _AUX_VISION_ROUTE_CACHE: Dict[Tuple[str, str], bool] = {}  # process-scoped: (provider, model) → bool
 # Approval state keyed by session_id so a gateway serving concurrent sessions can't leak one run's
 # "always approve" into another; callers without a session_id share "".
@@ -160,24 +161,26 @@ def active_computer_use_provider() -> ComputerUseProvider:
 def _new_backend(sid: str, permission_mode: str) -> ComputerUseBackend:
     return active_computer_use_provider().create_backend(sid, permission_mode)
 
-def _install_backend(sid: str, backend: ComputerUseBackend, permission_mode: str) -> ComputerUseBackend:
+def _backend_owner_key(session_id: str) -> Tuple[str, str]:
+    return hermes_home_key(), str(session_id or "")
+
+def _install_backend(owner: Tuple[str, str], backend: ComputerUseBackend, permission_mode: str) -> ComputerUseBackend:
     """Record a backend in the session caches (the empty session also mirrors it onto the ``_backend`` hook).
     Caller holds ``_backend_lock``."""
-    global _backend
-    _backends[sid], _backend_permission_modes[sid] = backend, permission_mode
-    _backend_call_locks[sid] = threading.RLock()
-    _backend = backend if sid == "" else _backend
+    _backends[owner], _backend_permission_modes[owner] = backend, permission_mode
+    _backend_call_locks[owner] = threading.RLock()
+    if owner[1] == "":
+        _backend[owner[0]] = backend
     return backend
 
-def _detach_locked(sid: str) -> Tuple[Optional[ComputerUseBackend], Optional[threading.RLock]]:
+def _detach_locked(owner: Tuple[str, str]) -> Tuple[Optional[ComputerUseBackend], Optional[threading.RLock]]:
     """Remove one session's cache entries, plus the ``_backend`` injection hook when it aliases the empty session
     (older callers/tests may populate only the hook). Caller holds ``_backend_lock``."""
-    global _backend
-    _backend_permission_modes.pop(sid, None)
-    backend, call_lock = _backends.pop(sid, None), _backend_call_locks.pop(sid, None)
-    if sid == "":
-        backend = _backend if backend is None else backend
-        _backend = None if _backend is backend else _backend
+    _backend_permission_modes.pop(owner, None)
+    backend, call_lock = _backends.pop(owner, None), _backend_call_locks.pop(owner, None)
+    if owner[1] == "":
+        injected = _backend.pop(owner[0], None)
+        backend = injected if backend is None else backend
     return backend, call_lock
 
 def _stop_backend(backend: ComputerUseBackend, call_lock: Optional[threading.RLock], on_error: Callable[[Exception], None]) -> None:
@@ -191,20 +194,21 @@ def _stop_backend(backend: ComputerUseBackend, call_lock: Optional[threading.RLo
 
 def _get_backend(session_id: str = "") -> ComputerUseBackend:
     sid = str(session_id or "")
+    owner = _backend_owner_key(sid)
     while True:
         with _backend_lock:
             # Mode resolved under the cache lock; YOLO mutation never holds the approval lock while releasing it.
             permission_mode = _cua_permission_mode(sid)
-            if sid == "" and _backend is not None and sid not in _backends:
-                _install_backend(sid, _backend, permission_mode)  # fold the injection hook into the cache
-            if (cached := _backends.get(sid)) is None:
+            if sid == "" and owner[0] in _backend and owner not in _backends:
+                _install_backend(owner, _backend[owner[0]], permission_mode)
+            if (cached := _backends.get(owner)) is None:
                 backend = _new_backend(sid, permission_mode)
                 backend.start()  # under the cache lock: one backend per session; a concurrent toggle releases it
-                return _install_backend(sid, backend, permission_mode)
-            if _backend_permission_modes.get(sid, "standard") == permission_mode:
+                return _install_backend(owner, backend, permission_mode)
+            if _backend_permission_modes.get(owner, "standard") == permission_mode:
                 return cached
             # Cua's mode is immutable after daemon startup: a /yolo toggle replaces only this session's backend.
-            _, stale_lock = _detach_locked(sid)  # stopped outside the cache lock; the loop re-reads the mode first
+            _, stale_lock = _detach_locked(owner)  # stopped outside the cache lock; the loop re-reads the mode first
         _stop_backend(cached, stale_lock, lambda e: None)
 
 def release_computer_use_session(session_id: str) -> bool:
@@ -213,7 +217,7 @@ def release_computer_use_session(session_id: str) -> bool:
     state is cleared even without a backend."""
     sid = str(session_id or "")
     with _backend_lock:
-        backend, call_lock = _detach_locked(sid)
+        backend, call_lock = _detach_locked(_backend_owner_key(sid))
     with _approval_lock:
         _session_auto_approve.pop(sid, None), _always_allow.pop(sid, None)
     if backend is None:
@@ -232,12 +236,11 @@ def _shutdown_backend_atexit() -> None:
     the Hermes process that spawned it (#28152 item 3). #69903 kept the orphan from burning a core by
     disabling the cursor overlay; the process itself still lingered.
     """
-    global _backend
     with _backend_lock:
         unique = {id(b): (b, _backend_call_locks.get(sid)) for sid, b in _backends.items()}
-        if _backend is not None:
-            unique.setdefault(id(_backend), (_backend, _backend_call_locks.get("")))
-        _backend = None
+        for home, backend in _backend.items():
+            unique.setdefault(id(backend), (backend, _backend_call_locks.get((home, ""))))
+        _backend.clear()
         _backends.clear(), _backend_call_locks.clear(), _backend_permission_modes.clear()
     with _approval_lock:
         _session_auto_approve.clear(), _always_allow.clear(), _escalation_warned.clear()
@@ -309,7 +312,7 @@ def handle_computer_use(args: Dict[str, Any], **kwargs) -> Any:
                                    "If a Python dependency is missing, the error above shows the exact install command."})
     try:
         with _backend_lock:
-            call_lock = _backend_call_locks.setdefault(session_id, threading.RLock())
+            call_lock = _backend_call_locks.setdefault(_backend_owner_key(session_id), threading.RLock())
         with call_lock:
             return _dispatch(backend, action, args)
     except Exception as e:

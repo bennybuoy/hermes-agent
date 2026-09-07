@@ -251,13 +251,15 @@ def test_release_seam_stops_exact_backend_and_clears_session_state():
 
     first = MagicMock()
     second = MagicMock()
+    owner_a = computer_use._backend_owner_key("conversation-a")
+    owner_b = computer_use._backend_owner_key("conversation-b")
     computer_use._backends.update({
-        "conversation-a": first,
-        "conversation-b": second,
+        owner_a: first,
+        owner_b: second,
     })
     computer_use._backend_call_locks.update({
-        "conversation-a": computer_use.threading.RLock(),
-        "conversation-b": computer_use.threading.RLock(),
+        owner_a: computer_use.threading.RLock(),
+        owner_b: computer_use.threading.RLock(),
     })
     computer_use._session_auto_approve["conversation-a"] = True
     computer_use._always_allow["conversation-a"] = {
@@ -269,11 +271,11 @@ def test_release_seam_stops_exact_backend_and_clears_session_state():
 
     first.stop.assert_called_once_with()
     second.stop.assert_not_called()
-    assert "conversation-a" not in computer_use._backends
-    assert "conversation-a" not in computer_use._backend_call_locks
+    assert owner_a not in computer_use._backends
+    assert owner_a not in computer_use._backend_call_locks
     assert "conversation-a" not in computer_use._session_auto_approve
     assert "conversation-a" not in computer_use._always_allow
-    assert computer_use._backends["conversation-b"] is second
+    assert computer_use._backends[owner_b] is second
 
 
 def test_release_seam_evicts_state_even_when_backend_stop_fails():
@@ -281,13 +283,14 @@ def test_release_seam_evicts_state_even_when_backend_stop_fails():
 
     backend = MagicMock()
     backend.stop.side_effect = RuntimeError("driver teardown failed")
-    computer_use._backends["failed-run"] = backend
-    computer_use._backend_call_locks["failed-run"] = computer_use.threading.RLock()
+    owner = computer_use._backend_owner_key("failed-run")
+    computer_use._backends[owner] = backend
+    computer_use._backend_call_locks[owner] = computer_use.threading.RLock()
     computer_use._session_auto_approve["failed-run"] = True
 
     assert computer_use.release_computer_use_session("failed-run") is True
-    assert "failed-run" not in computer_use._backends
-    assert "failed-run" not in computer_use._backend_call_locks
+    assert owner not in computer_use._backends
+    assert owner not in computer_use._backend_call_locks
     assert "failed-run" not in computer_use._session_auto_approve
 
 
@@ -296,8 +299,9 @@ def test_release_seam_waits_for_in_flight_action_before_stopping_backend():
 
     backend = MagicMock()
     call_lock = computer_use.threading.RLock()
-    computer_use._backends["cancelled-run"] = backend
-    computer_use._backend_call_locks["cancelled-run"] = call_lock
+    owner = computer_use._backend_owner_key("cancelled-run")
+    computer_use._backends[owner] = backend
+    computer_use._backend_call_locks[owner] = call_lock
 
     pool = ThreadPoolExecutor(max_workers=1)
     try:

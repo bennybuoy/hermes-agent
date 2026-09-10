@@ -146,6 +146,15 @@ class _Record:
     started_at: Optional[float] = None
     completed_at: Optional[float] = None
     result: Optional[SubagentResult] = None
+    # Child-activity stall bookkeeping (see _STALL_* constants): last structured
+    # progress sample, the monotonic instant it was first observed, whether the
+    # child was inside a tool at sample time, and the fixed post-interrupt grace
+    # deadline. All are read/written under _REGISTRY.lock.
+    last_progress_token: Optional[tuple] = None
+    progress_started_at: Optional[float] = None
+    in_tool: bool = False
+    stall_grace_deadline: Optional[float] = None
+    terminal_event: threading.Event = dataclasses.field(default_factory=threading.Event)
 
 
 @dataclasses.dataclass
@@ -193,6 +202,19 @@ def get_active_subagent_parent() -> Any:
 
 def _opt_str(value: Any) -> bool:
     return value is None or isinstance(value, str)
+
+
+def _sample_child_progress(child: Any, previous: Optional[tuple[tuple, bool]] = None) -> tuple[tuple, bool]:
+    """Structured progress token for one child, mirroring delegate-tool's ``_batch_progress_token``:
+    ``(api_call_count, current_tool, last_activity_ts)`` plus ``in_tool = bool(current_tool)``.
+    An unreadable child keeps the previous sample — a child that cannot be read must never look
+    healthy by accident."""
+    try:
+        summary = child.get_activity_summary()
+        token = (summary.get("api_call_count", 0), summary.get("current_tool"), summary.get("last_activity_ts"))
+        return token, bool(summary.get("current_tool"))
+    except Exception:
+        return previous if previous is not None else ((0, None, None), False)
 
 
 def _session_id_of(agent: Any) -> Optional[str]:
@@ -287,6 +309,14 @@ class SubagentLifecycleService:
         record.future = _EXECUTOR.submit(self._run, record, request.goal, parent)
         return handle
 
+    @staticmethod
+    def _stamp_progress_locked(record: _Record) -> None:
+        """Initial/refreshed progress sample at the PENDING→RUNNING transition (monotonic clock)."""
+        previous = None if record.last_progress_token is None else ((record.last_progress_token, record.in_tool))
+        token, in_tool = _sample_child_progress(record.agent, previous=previous)
+        record.last_progress_token, record.in_tool = token, in_tool
+        record.progress_started_at = time.monotonic()
+
     def status(self, handle: SubagentHandle) -> SubagentStatus:
         record = self._record(handle)
         if record is None:
@@ -370,6 +400,7 @@ class SubagentLifecycleService:
             if record.state is not SubagentState.CANCEL_REQUESTED:
                 record.state = SubagentState.RUNNING
             record.started_at = record.updated_at = time.time()
+            self._stamp_progress_locked(record)
         try:
             from tools.delegate_tool import _run_child_lifecycle
             raw = _run_child_lifecycle(0, goal, record.agent, parent)

@@ -1,5 +1,6 @@
 """Contract tests for the public plugin subagent lifecycle API."""
 
+import threading
 import time
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -11,6 +12,7 @@ from agent.subagent_lifecycle import (
     SubagentLifecycleError,
     SubagentLifecycleService,
     SubagentState,
+    _sample_child_progress,
     bind_subagent_parent,
     get_active_subagent_parent,
 )
@@ -27,6 +29,13 @@ class FakeChild:
         self.interrupt_kind = None
         self.interrupt_message = None
         self.tool_reason = None
+        self.activity_summary = {"api_call_count": 0, "current_tool": None, "last_activity_ts": time.time()}
+        self.summary_error: Exception | None = None
+
+    def get_activity_summary(self):
+        if self.summary_error is not None:
+            raise self.summary_error
+        return dict(self.activity_summary)
 
     def interrupt(self, _reason):
         self.interrupted = True
@@ -197,3 +206,48 @@ def test_stall_timeout_accepts_floor_and_disables_on_none(lifecycle):
 def test_timeout_seconds_still_rejected_when_both_supplied(lifecycle):
     with pytest.raises(SubagentLifecycleError, match="Per-launch timeout"):
         lifecycle.launch(SubagentLaunchRequest(goal="g", stall_timeout_seconds=600, timeout_seconds=60))
+
+
+# ── A2: per-record child progress sampling ──────────────────────────────────
+def test_progress_token_is_structured_tuple_from_activity_summary(lifecycle):
+    child = FakeChild("sa-token-shape")
+    child.activity_summary = {"api_call_count": 4, "current_tool": "bash", "last_activity_ts": 1234.5}
+    token, in_tool = _sample_child_progress(child)
+    assert token == (4, "bash", 1234.5)
+    assert in_tool is True
+    child.activity_summary = {"api_call_count": 5, "current_tool": None, "last_activity_ts": 1235.0}
+    token, in_tool = _sample_child_progress(child)
+    assert token == (5, None, 1235.0)
+    assert in_tool is False
+
+
+def test_sample_unreadable_child_keeps_previous_sample():
+    child = FakeChild("sa-broken")
+    child.summary_error = RuntimeError("child gone")
+    previous = ((0, None, 1.0), False)
+    token, in_tool = _sample_child_progress(child, previous=previous)
+    assert (token, in_tool) == previous
+
+
+def test_launch_stamps_initial_progress_sample(lifecycle):
+    handle = lifecycle.launch(SubagentLaunchRequest(goal="sample me"))
+    record = lifecycle._record(handle)
+    deadline = time.monotonic() + 5
+    while record.state is SubagentState.PENDING and time.monotonic() < deadline:
+        time.sleep(0.001)
+    assert record.last_progress_token is not None
+    assert isinstance(record.progress_started_at, float)
+    assert record.in_tool is False
+    lifecycle.wait(handle, timeout_seconds=5)
+
+
+def test_mode_transition_changes_token(lifecycle):
+    child = FakeChild("sa-mode")
+    child.activity_summary = {"api_call_count": 1, "current_tool": None, "last_activity_ts": 10.0}
+    token, in_tool = _sample_child_progress(child)
+    assert in_tool is False
+    # Entering a tool is itself an activity transition: token changes and in_tool flips.
+    child.activity_summary = {"api_call_count": 1, "current_tool": "bash", "last_activity_ts": 11.0}
+    new_token, new_in_tool = _sample_child_progress(child)
+    assert new_token != token
+    assert new_in_tool is True

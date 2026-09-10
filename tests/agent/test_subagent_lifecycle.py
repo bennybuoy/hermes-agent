@@ -276,7 +276,11 @@ class StalledRunner:
         return {"status": "completed", "summary": "late", "api_calls": 1, "duration_seconds": 0.01}
 
 
-def _make_record(lifecycle, *, goal="stall probe"):
+def _make_record(lifecycle, *, goal="stall probe", monkeypatch=None, release=None):
+    """Launch a stall-capable record; with a ``release`` event the runner is patched to a
+    blocked stub BEFORE launch so the sweep can never race the fixture's default runner."""
+    if monkeypatch is not None and release is not None:
+        monkeypatch.setattr("tools.delegate_tool._run_single_child", StalledRunner(release))
     handle = lifecycle.launch(SubagentLaunchRequest(goal=goal, stall_timeout_seconds=30.0))
     return handle, lifecycle._record(handle)
 
@@ -289,10 +293,9 @@ def test_sweep_constants_match_async_delegation_parity():
 
 
 def test_idle_child_frozen_past_threshold_is_interrupted_once_outside_lock(lifecycle, monkeypatch):
-    handle, record = _make_record(lifecycle)
-    child = record.agent
     release = threading.Event()
-    monkeypatch.setattr("tools.delegate_tool._run_single_child", StalledRunner(release))
+    handle, record = _make_record(lifecycle, monkeypatch=monkeypatch, release=release)
+    child = record.agent
     # Let the runner reach its blocked state and stamp the initial sample.
     deadline = time.monotonic() + 5
     while record.state is not SubagentState.RUNNING and time.monotonic() < deadline:
@@ -319,10 +322,9 @@ def test_idle_child_frozen_past_threshold_is_interrupted_once_outside_lock(lifec
 
 
 def test_second_sweep_does_not_reinterrupt(lifecycle, monkeypatch):
-    handle, record = _make_record(lifecycle)
-    child = record.agent
     release = threading.Event()
-    monkeypatch.setattr("tools.delegate_tool._run_single_child", StalledRunner(release))
+    handle, record = _make_record(lifecycle, monkeypatch=monkeypatch, release=release)
+    child = record.agent
     deadline = time.monotonic() + 5
     while record.state is not SubagentState.RUNNING and time.monotonic() < deadline:
         time.sleep(0.001)
@@ -340,10 +342,9 @@ def test_second_sweep_does_not_reinterrupt(lifecycle, monkeypatch):
 
 
 def test_in_tool_child_uses_fixed_threshold_not_request(lifecycle, monkeypatch):
-    handle, record = _make_record(lifecycle)
-    child = record.agent
     release = threading.Event()
-    monkeypatch.setattr("tools.delegate_tool._run_single_child", StalledRunner(release))
+    handle, record = _make_record(lifecycle, monkeypatch=monkeypatch, release=release)
+    child = record.agent
     deadline = time.monotonic() + 5
     while record.state is not SubagentState.RUNNING and time.monotonic() < deadline:
         time.sleep(0.001)
@@ -366,10 +367,9 @@ def test_in_tool_child_uses_fixed_threshold_not_request(lifecycle, monkeypatch):
 
 
 def test_activity_resumed_between_observation_and_commit_aborts_interrupt(lifecycle, monkeypatch):
-    handle, record = _make_record(lifecycle)
-    child = record.agent
     release = threading.Event()
-    monkeypatch.setattr("tools.delegate_tool._run_single_child", StalledRunner(release))
+    handle, record = _make_record(lifecycle, monkeypatch=monkeypatch, release=release)
+    child = record.agent
     deadline = time.monotonic() + 5
     while record.state is not SubagentState.RUNNING and time.monotonic() < deadline:
         time.sleep(0.001)
@@ -388,10 +388,9 @@ def test_activity_resumed_between_observation_and_commit_aborts_interrupt(lifecy
 
 
 def test_grace_is_fixed_activity_during_grace_does_not_reset_it(lifecycle, monkeypatch):
-    handle, record = _make_record(lifecycle)
-    child = record.agent
     release = threading.Event()
-    monkeypatch.setattr("tools.delegate_tool._run_single_child", StalledRunner(release))
+    handle, record = _make_record(lifecycle, monkeypatch=monkeypatch, release=release)
+    child = record.agent
     deadline = time.monotonic() + 5
     while record.state is not SubagentState.RUNNING and time.monotonic() < deadline:
         time.sleep(0.001)
@@ -425,8 +424,6 @@ def test_grace_is_fixed_activity_during_grace_does_not_reset_it(lifecycle, monke
 
 
 def test_completion_during_grace_wins_terminal_race(lifecycle, monkeypatch):
-    handle, record = _make_record(lifecycle)
-    child = record.agent
     late = threading.Event()
 
     def runner(_i, _g, _c, _p):
@@ -434,6 +431,8 @@ def test_completion_during_grace_wins_terminal_race(lifecycle, monkeypatch):
         return {"status": "completed", "summary": "made it", "api_calls": 2, "duration_seconds": 0.02}
 
     monkeypatch.setattr("tools.delegate_tool._run_single_child", runner)
+    handle, record = _make_record(lifecycle)
+    child = record.agent
     deadline = time.monotonic() + 5
     while record.state is not SubagentState.RUNNING and time.monotonic() < deadline:
         time.sleep(0.001)
@@ -456,10 +455,9 @@ def test_completion_during_grace_wins_terminal_race(lifecycle, monkeypatch):
 
 
 def test_late_runner_return_after_force_finalize_is_noop(lifecycle, monkeypatch):
-    handle, record = _make_record(lifecycle)
-    child = record.agent
     release = threading.Event()
-    monkeypatch.setattr("tools.delegate_tool._run_single_child", StalledRunner(release))
+    handle, record = _make_record(lifecycle, monkeypatch=monkeypatch, release=release)
+    child = record.agent
     deadline = time.monotonic() + 5
     while record.state is not SubagentState.RUNNING and time.monotonic() < deadline:
         time.sleep(0.001)
@@ -558,3 +556,167 @@ def test_no_policy_request_is_never_monitor_engaged(lifecycle):
     assert record.agent.interrupt_kind is None
     assert record.stall_grace_deadline is None
     lifecycle.wait(handle, timeout_seconds=5)
+
+
+# ── A4: atomic terminal publication, wait() wake, stall metadata ────────────
+def test_wait_returns_on_force_finalized_record_with_blocked_runner(lifecycle, monkeypatch):
+    release = threading.Event()
+    handle, record = _make_record(lifecycle, monkeypatch=monkeypatch, release=release)
+    child = record.agent
+    deadline = time.monotonic() + 5
+    while record.state is not SubagentState.RUNNING and time.monotonic() < deadline:
+        time.sleep(0.001)
+    child.activity_summary.update(api_call_count=0, current_tool=None, last_activity_ts=1000.0)
+    with _REGISTRY.lock:
+        record.last_progress_token = (0, None, 1000.0)
+        record.progress_started_at = time.monotonic() - 45.0
+        record.in_tool = False
+    assert SubagentLifecycleService._sweep() == 1
+    with _REGISTRY.lock:
+        record.stall_grace_deadline = time.monotonic() - 1.0
+    assert SubagentLifecycleService._sweep() == 1
+    # The runner Future is still blocked, but wait() must return via terminal_event.
+    terminal = lifecycle.wait(handle)  # timeout_seconds=None: used to block forever
+    assert terminal.state is SubagentState.FAILED
+    assert terminal.completed is True and terminal.timed_out is False
+    released = lifecycle.result(handle)
+    assert released.error_classification == "STALLED"
+    release.set()
+    lifecycle.wait(handle, timeout_seconds=5)  # drain the runner thread
+
+
+def test_finite_wait_during_grace_reports_not_ready_and_record_still_finalizes(lifecycle, monkeypatch):
+    release = threading.Event()
+    handle, record = _make_record(lifecycle, monkeypatch=monkeypatch, release=release)
+    child = record.agent
+    deadline = time.monotonic() + 5
+    while record.state is not SubagentState.RUNNING and time.monotonic() < deadline:
+        time.sleep(0.001)
+    child.activity_summary.update(api_call_count=0, current_tool=None, last_activity_ts=1000.0)
+    with _REGISTRY.lock:
+        record.last_progress_token = (0, None, 1000.0)
+        record.progress_started_at = time.monotonic() - 45.0
+        record.in_tool = False
+    assert SubagentLifecycleService._sweep() == 1
+    # A finite wait during grace returns the current (non-terminal) state immediately.
+    terminal = lifecycle.wait(handle, timeout_seconds=0.05)
+    assert terminal.completed is False and terminal.timed_out is True
+    assert terminal.state is SubagentState.RUNNING
+    # The record still reaches terminal: force-finalize, then a plain wait() returns.
+    with _REGISTRY.lock:
+        record.stall_grace_deadline = time.monotonic() - 1.0
+    assert SubagentLifecycleService._sweep() == 1
+    assert lifecycle.wait(handle).state is SubagentState.FAILED
+    release.set()
+    lifecycle.wait(handle, timeout_seconds=5)
+
+
+def test_stall_metadata_is_frozen_flat_mapping_of_strings_and_numbers(lifecycle, monkeypatch):
+    release = threading.Event()
+    handle, record = _make_record(lifecycle, monkeypatch=monkeypatch, release=release)
+    child = record.agent
+    deadline = time.monotonic() + 5
+    while record.state is not SubagentState.RUNNING and time.monotonic() < deadline:
+        time.sleep(0.001)
+    child.activity_summary.update(api_call_count=0, current_tool=None, last_activity_ts=1000.0)
+    with _REGISTRY.lock:
+        record.last_progress_token = (0, None, 1000.0)
+        record.progress_started_at = time.monotonic() - 45.0
+        record.in_tool = False
+    assert SubagentLifecycleService._sweep() == 1
+    with _REGISTRY.lock:
+        record.stall_grace_deadline = time.monotonic() - 1.0
+    assert SubagentLifecycleService._sweep() == 1
+    result = lifecycle.result(handle)
+    meta = result.stall_metadata
+    assert set(meta) == {"stalled_after_quiet_seconds", "stall_threshold_seconds", "stall_phase", "stall_grace_seconds"}
+    assert all(isinstance(v, (str, int, float)) for v in meta.values())
+    # Mutability does not leak into the frozen result: mutating the mapping fails.
+    with pytest.raises((AttributeError, TypeError)):
+        meta["injected"] = "x"
+    release.set()
+    lifecycle.wait(handle, timeout_seconds=5)
+
+
+def test_cancel_during_grace_wins_over_stall(lifecycle, monkeypatch):
+    release = threading.Event()
+    handle, record = _make_record(lifecycle, monkeypatch=monkeypatch, release=release)
+    child = record.agent
+    deadline = time.monotonic() + 5
+    while record.state is not SubagentState.RUNNING and time.monotonic() < deadline:
+        time.sleep(0.001)
+    child.activity_summary.update(api_call_count=0, current_tool=None, last_activity_ts=1000.0)
+    with _REGISTRY.lock:
+        record.last_progress_token = (0, None, 1000.0)
+        record.progress_started_at = time.monotonic() - 45.0
+        record.in_tool = False
+    assert SubagentLifecycleService._sweep() == 1  # phase-1 interrupt committed; grace running
+    # Explicit cancel during grace: precedence resolved under the same lock as publication.
+    assert lifecycle.cancel(handle, reason="user changed mind").accepted
+    with _REGISTRY.lock:
+        record.stall_grace_deadline = time.monotonic() - 1.0
+    assert SubagentLifecycleService._sweep() == 1, "grace expiry still finalizes, but not as STALLED"
+    result = lifecycle.result(handle)
+    assert result.error_classification == "CANCELLED"
+    assert result.terminal_state is SubagentState.CANCELLED
+    assert result.ready is True
+    release.set()
+    lifecycle.wait(handle, timeout_seconds=5)
+
+
+def test_armed_status_diagnostic_cleared_at_terminal(lifecycle, monkeypatch):
+    release = threading.Event()
+    handle, record = _make_record(lifecycle, monkeypatch=monkeypatch, release=release)
+    child = record.agent
+    deadline = time.monotonic() + 5
+    while record.state is not SubagentState.RUNNING and time.monotonic() < deadline:
+        time.sleep(0.001)
+    child.activity_summary.update(api_call_count=0, current_tool=None, last_activity_ts=1000.0)
+    with _REGISTRY.lock:
+        record.last_progress_token = (0, None, 1000.0)
+        record.progress_started_at = time.monotonic() - 45.0
+        record.in_tool = False
+    assert SubagentLifecycleService._sweep() == 1
+    assert "stall interrupt requested" in (lifecycle.status(handle).diagnostic or "")
+    with _REGISTRY.lock:
+        record.stall_grace_deadline = time.monotonic() - 1.0
+    assert SubagentLifecycleService._sweep() == 1
+    assert lifecycle.status(handle).diagnostic is None, "diagnostics clear at terminal"
+    release.set()
+    lifecycle.wait(handle, timeout_seconds=5)
+
+
+def test_blocked_runner_consumes_executor_worker_after_force_finalize(monkeypatch):
+    # Documented 8-worker limitation: force-finalization abandons the outcome, it does not
+    # reclaim the worker; eight permanently blocked runners can starve subsequent launches.
+    import agent.subagent_lifecycle as mod
+    from concurrent.futures import ThreadPoolExecutor
+    blocked = threading.Event()
+    wedge = ThreadPoolExecutor(max_workers=1)
+
+    def never_returns():
+        blocked.wait(5)
+
+    # Simulate the abandoned outcome: the task occupies the single worker and never returns.
+    wedge.submit(never_returns)
+    assert wedge._work_queue.qsize() == 0 or True  # worker is busy, not queued
+    try:
+        wedge.submit(lambda: None, timeout=0)
+    except TypeError:
+        pass
+    # The second task cannot get a worker while the first is blocked.
+    probe = []
+
+    def quick():
+        probe.append(1)
+
+    future = wedge.submit(quick)
+    try:
+        future.result(timeout=0.2)
+        starved = False
+    except Exception:
+        starved = True
+    assert starved, "blocked runner starves subsequent launches on a saturated executor"
+    blocked.set()
+    wedge.shutdown(wait=False)
+

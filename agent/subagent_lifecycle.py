@@ -17,6 +17,7 @@ import contextlib
 import weakref
 from contextlib import contextmanager
 from concurrent.futures import Future, TimeoutError
+from types import MappingProxyType
 from typing import Any, Callable, Mapping, Optional
 
 from agent.interrupt_compat import request_hard_interrupt
@@ -178,6 +179,8 @@ class _Record:
     stall_threshold_seconds: Optional[float] = None
     stall_phase: Optional[str] = None
     stall_interrupt_requested: bool = False
+    # Set by cancel(): the monitor's force-finalization must honour cancellation precedence.
+    stall_cancel_precedence: bool = False
     terminal_event: threading.Event = dataclasses.field(default_factory=threading.Event)
 
 
@@ -243,14 +246,15 @@ def _stall_monitor_loop(generation: int) -> None:
 from agent.interrupt_compat import request_hard_interrupt as _request_hard_interrupt
 
 
-def _stall_metadata(record: _Record, quiet_seconds: float, threshold: float) -> dict[str, Any]:
-    """Structured stall metadata — additive, present only on stall finalizations."""
-    return {
+def _stall_metadata(record: _Record, quiet_seconds: float, threshold: float) -> Mapping[str, Any]:
+    """Structured stall metadata — additive, present only on stall finalizations. Returned
+    frozen (read-only view) so mutability never leaks into the frozen result."""
+    return MappingProxyType({
         "stalled_after_quiet_seconds": round(quiet_seconds, 2),
         "stall_threshold_seconds": threshold,
         "stall_phase": "in_tool" if record.in_tool else "idle",
         "stall_grace_seconds": _STALL_GRACE_SECONDS,
-    }
+    })
 from tools.daemon_pool import DaemonThreadPoolExecutor as _DaemonExecutor  # daemon: a wedged child never blocks exit
 _EXECUTOR = _DaemonExecutor(max_workers=8, thread_name_prefix="hermes-lifecycle")
 _SECRET = secrets.token_bytes(32)
@@ -486,7 +490,21 @@ class SubagentLifecycleService:
 
     @staticmethod
     def _force_finalize_stalled(record: _Record, quiet_seconds: float, threshold: float) -> int:
-        """Terminal FAILED/STALLED publication for a record whose fixed grace expired."""
+        """Terminal publication for a record whose fixed grace expired. Cancellation-vs-stall
+        precedence is resolved here under the registry lock (via ``_publish_terminal``): a
+        record whose runner returned CANCELLED first, or whose state is CANCEL_REQUESTED,
+        keeps the cancellation classification — the stall does not overwrite it."""
+        if record.state is SubagentState.CANCEL_REQUESTED:
+            error_message = (
+                f"Subagent {record.handle.subagent_id} was cancelled during the stall grace window "
+                "and did not return; finalized as cancelled rather than stalled.")
+            result = SubagentLifecycleService._with_result_hash(SubagentResult(
+                record.handle, SubagentState.CANCELLED, True, summary=None,
+                error_classification="CANCELLED", error_message=error_message,
+                started_at=record.started_at, completed_at=time.time(),
+                stall_metadata=_stall_metadata(record, quiet_seconds, threshold),
+            ))
+            return 1 if SubagentLifecycleService._publish_terminal(record, result) else 0
         error_message = (
             f"Subagent {record.handle.subagent_id} stalled: the child stopped making progress "
             "(no new API calls, tool transitions, or streamed tokens), did not respond to "
@@ -517,8 +535,17 @@ class SubagentLifecycleService:
 
     @staticmethod
     def _with_result_hash(result: SubagentResult) -> SubagentResult:
-        payload = dataclasses.asdict(result)
-        payload.pop("result_hash", None)
+        # Build the hash preimage manually: dataclasses.asdict deep-copies field values and
+        # a frozen mapping view (stall_metadata) cannot be pickled/deep-copied. A plain-dict
+        # copy keeps the preimage stable, printable, and serializable.
+        payload: dict[str, Any] = {}
+        for field in dataclasses.fields(result):
+            value = getattr(result, field.name)
+            if field.name == "result_hash":
+                continue
+            if field.name == "stall_metadata" and isinstance(value, MappingProxyType):
+                value = dict(value)
+            payload[field.name] = value
         return dataclasses.replace(
             result, result_hash=hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest())
 
@@ -528,7 +555,9 @@ class SubagentLifecycleService:
             return SubagentStatus(handle, SubagentState.UNKNOWN, time.time(), "UNKNOWN_HANDLE")
         with _REGISTRY.lock:
             diagnostic = None
-            if record.stall_grace_deadline is not None:
+            if record.result is not None:
+                pass  # terminal: phase-1 diagnostics cleared
+            elif record.stall_grace_deadline is not None:
                 # Phase-2/grace diagnostic; the metadata ``stall_phase`` keeps its
                 # async-delegation meaning (idle|in_tool), never phase 1/2.
                 remaining = max(0.0, record.stall_grace_deadline - time.monotonic())
@@ -552,13 +581,14 @@ class SubagentLifecycleService:
         record = self._record(handle)
         if record is None:
             return SubagentTerminalState(handle, SubagentState.UNKNOWN, True, diagnostic="UNKNOWN_HANDLE")
-        try:
-            if record.future is not None:
-                record.future.result(timeout=timeout_seconds)
-        except TimeoutError:
-            return SubagentTerminalState(record.handle, record.state, False, True)
-        except Exception:
-            pass
+        # Wait on the per-record terminal_event, NOT the runner Future: a record
+        # force-finalized by the stall monitor has no completing Future to wait on, and a
+        # blocked runner must never hold callers hostage. With a finite timeout the caller
+        # gets the current state and ``timed_out=True`` — this limits the CALLER's wait,
+        # never the child's.
+        if not record.terminal_event.wait(timeout_seconds):
+            with _REGISTRY.lock:
+                return SubagentTerminalState(record.handle, record.state, False, True)
         with _REGISTRY.lock:
             return SubagentTerminalState(record.handle, record.state, record.result is not None)
 
@@ -572,6 +602,10 @@ class SubagentLifecycleService:
             agent = record.agent
             record.state = SubagentState.CANCEL_REQUESTED
             record.updated_at = time.time()
+            # Cancellation-vs-stall precedence is resolved at publication, under the same
+            # lock: a record whose CANCEL_REQUESTED won the state must never be republished
+            # as FAILED/STALLED by the stall monitor, and vice versa.
+            record.stall_cancel_precedence = True
         accepted = False
         if agent is not None:
             with contextlib.suppress(Exception):

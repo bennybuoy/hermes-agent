@@ -1,5 +1,15 @@
 """Public, plugin-safe lifecycle API for delegated Hermes subagents: immutable contracts, not ``AIAgent``
-objects. Plugins obtain it via ``PluginContext.subagent_lifecycle``."""
+objects. Plugins obtain it via ``PluginContext.subagent_lifecycle``.
+
+Children run on a bounded daemon executor and are supervised by an opt-in, per-launch inactivity
+watchdog (``SubagentLaunchRequest.stall_timeout_seconds``): a lazily-started monitor thread samples
+each child's structured progress token and — for a child frozen past the idle threshold (or the fixed
+in-tool ceiling) — requests a hard interrupt, gives a FIXED grace window, and force-finalizes a
+record whose runner still has not returned. The terminal state stays ``FAILED`` with
+``error_classification="STALLED"`` plus structured ``stall_metadata``; no new enum member exists.
+This is a liveness watchdog, not a progress detector or overall deadline: a stuck provider request
+with a functioning non-streaming heartbeat stays "alive" to it, and transport watchdogs plus
+configured delegation timeouts remain independently effective."""
 
 from __future__ import annotations
 
@@ -578,6 +588,8 @@ class SubagentLifecycleService:
             return SubagentStatus(record.handle, record.state, record.updated_at, diagnostic)
 
     def wait(self, handle: SubagentHandle, *, timeout_seconds: Optional[float] = None) -> SubagentTerminalState:
+        """Wait until the record's terminal publication (not the runner Future). ``timeout_seconds``
+        limits the CALLER's wait, never the child's runtime."""
         record = self._record(handle)
         if record is None:
             return SubagentTerminalState(handle, SubagentState.UNKNOWN, True, diagnostic="UNKNOWN_HANDLE")

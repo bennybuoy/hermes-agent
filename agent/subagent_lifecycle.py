@@ -27,6 +27,8 @@ _MAX_CONTEXT_CHARS = 32_000
 _MAX_METADATA_BYTES = 8_192
 _MAX_RESULT_CHARS = 32_000
 _TERMINAL_RETENTION_SECONDS = 3_600
+# Herald-parity floor for the opt-in inactivity watchdog; lower values are rejected at launch.
+_STALL_TIMEOUT_MIN_SECONDS = 30.0
 
 
 class SubagentLifecycleError(ValueError):
@@ -58,6 +60,7 @@ class SubagentLaunchRequest:
     correlation_id: Optional[str] = None
     metadata: Mapping[str, Any] = dataclasses.field(default_factory=dict)
     timeout_seconds: Optional[float] = None
+    stall_timeout_seconds: Optional[float] = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -223,6 +226,11 @@ _REQUEST_REJECTIONS: tuple[tuple[Callable[[Any], bool], str], ...] = (
      "context must be a string of at most 32000 characters."),
     (lambda r: r.role not in {"leaf", "orchestrator"}, "role must be 'leaf' or 'orchestrator'."),
     (lambda r: r.timeout_seconds is not None, "Per-launch timeout is not supported; configure delegation timeout explicitly."),
+    (lambda r: r.stall_timeout_seconds is not None
+     and (isinstance(r.stall_timeout_seconds, bool) or not isinstance(r.stall_timeout_seconds, (int, float))
+          or not math.isfinite(r.stall_timeout_seconds) or r.stall_timeout_seconds < _STALL_TIMEOUT_MIN_SECONDS),
+     f"stall_timeout_seconds must be a finite number of at least {_STALL_TIMEOUT_MIN_SECONDS:g} seconds "
+     "(None disables the stall monitor for this child)."),
     (lambda r: r.working_directory is not None,
      "working_directory is not supported because Hermes delegates use isolated task environments."),
     (lambda r: bool(r.blocked_tools),

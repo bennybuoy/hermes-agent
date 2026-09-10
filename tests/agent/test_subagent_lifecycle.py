@@ -178,3 +178,22 @@ def test_agent_turn_binds_and_clears_lifecycle_parent(monkeypatch):
     assert agent.run_conversation("hello") == {"final_response": "ok"}
     assert observed == [agent]
     assert get_active_subagent_parent() is None
+
+
+# ── A1: opt-in stall_timeout_seconds request field ──────────────────────────
+def test_stall_timeout_rejects_invalid_values(lifecycle):
+    for bad in (0, -5, 29.9, "600", True, float("nan"), float("inf")):
+        with pytest.raises(SubagentLifecycleError, match="stall_timeout_seconds"):
+            lifecycle.launch(SubagentLaunchRequest(goal="g", stall_timeout_seconds=bad))
+
+
+def test_stall_timeout_accepts_floor_and_disables_on_none(lifecycle):
+    # 30.0 floor is accepted; None (default) = monitor off for this child.
+    handle = lifecycle.launch(SubagentLaunchRequest(goal="g", stall_timeout_seconds=30.0))
+    lifecycle.wait(handle, timeout_seconds=5)
+    assert lifecycle.result(handle).terminal_state is SubagentState.SUCCEEDED
+
+
+def test_timeout_seconds_still_rejected_when_both_supplied(lifecycle):
+    with pytest.raises(SubagentLifecycleError, match="Per-launch timeout"):
+        lifecycle.launch(SubagentLaunchRequest(goal="g", stall_timeout_seconds=600, timeout_seconds=60))

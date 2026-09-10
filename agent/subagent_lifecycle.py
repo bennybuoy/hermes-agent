@@ -454,16 +454,20 @@ class SubagentLifecycleService:
                     to_finalize.append((record, record.stall_quiet_seconds or 0.0,
                                         record.stall_threshold_seconds or _STALL_IN_TOOL_SECONDS))
                 continue
-            quiet = max(0.0, now_mono - (record.progress_started_at or now_mono))
-            threshold = _STALL_IN_TOOL_SECONDS if record.in_tool else record.request_stall_timeout_seconds
-            if quiet < threshold:
-                continue
-            # Revalidate the frozen observation before committing the interrupt.
+            # Sample EVERY sweep BEFORE evaluating expiry: a frozen token keeps the
+            # quiet clock running, but a changed token — including a tool exit (a
+            # mode transition is itself activity) — re-arms the clock and switches
+            # the effective threshold, so the fixed in-tool ceiling never outlives
+            # the tool call that set it.
             token, in_tool = _sample_child_progress(record.agent, previous=(record.last_progress_token, record.in_tool))
             if token != record.last_progress_token:
                 record.last_progress_token, record.in_tool = token, in_tool
                 record.progress_started_at = now_mono
-                continue  # activity resumed between observation and commit: abort
+                continue  # fresh activity adopted: the clock re-armed
+            quiet = max(0.0, now_mono - (record.progress_started_at or now_mono))
+            threshold = _STALL_IN_TOOL_SECONDS if record.in_tool else record.request_stall_timeout_seconds
+            if quiet < threshold:
+                continue
             record.stall_quiet_seconds, record.stall_threshold_seconds = quiet, threshold
             record.stall_phase = "in_tool" if in_tool else "idle"
             record.stall_grace_deadline = now_mono + _STALL_GRACE_SECONDS  # fixed from commit instant

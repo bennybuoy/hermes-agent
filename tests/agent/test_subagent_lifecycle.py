@@ -285,6 +285,15 @@ def _make_record(lifecycle, *, goal="stall probe", monkeypatch=None, release=Non
     return handle, lifecycle._record(handle)
 
 
+def _await_child_interrupt(child, timeout: float = 5.0) -> None:
+    """Wait until the child observes its stall interrupt (sync now, daemon-thread later)."""
+    deadline = time.monotonic() + timeout
+    while not getattr(child, "interrupted", False):
+        if time.monotonic() >= deadline:
+            pytest.fail("child never observed its stall interrupt")
+        time.sleep(0.001)
+
+
 def test_sweep_constants_match_async_delegation_parity():
     assert _STALL_SWEEP_SECONDS == 30.0
     assert _STALL_GRACE_SECONDS == 120.0
@@ -317,6 +326,43 @@ def test_idle_child_frozen_past_threshold_is_interrupted_once_outside_lock(lifec
     assert "stall interrupt requested" in (lifecycle.status(handle).diagnostic or "")
     assert "mode=idle" in (lifecycle.status(handle).diagnostic or "")
     assert "threshold=30" in (lifecycle.status(handle).diagnostic or "")
+    release.set()
+    lifecycle.wait(handle, timeout_seconds=5)
+
+
+def test_tool_exit_resampled_every_sweep_rearms_clock(lifecycle, monkeypatch):
+    # F1: a child that LEAVES a tool while quiet < in-tool ceiling must be re-sampled on
+    # the next sweep — the mode transition re-arms the quiet clock and switches the
+    # effective threshold, so the fixed 1200s ceiling never outlives the tool call.
+    release = threading.Event()
+    handle, record = _make_record(lifecycle, monkeypatch=monkeypatch, release=release)
+    child = record.agent
+    deadline = time.monotonic() + 5
+    while record.state is not SubagentState.RUNNING and time.monotonic() < deadline:
+        time.sleep(0.001)
+    # Frozen INSIDE a tool, quiet past the idle threshold but far below 1200s.
+    child.activity_summary.update(api_call_count=3, current_tool="bash", last_activity_ts=1000.0)
+    with _REGISTRY.lock:
+        record.last_progress_token = (3, "bash", 1000.0)
+        record.progress_started_at = time.monotonic() - 45.0
+        record.in_tool = True
+    assert SubagentLifecycleService._sweep() == 0, "in-tool child must not interrupt below the fixed ceiling"
+    # The child LEAVES the tool (real activity): the next sweep must observe the
+    # transition even though quiet is still below the in-tool ceiling.
+    child.activity_summary.update(api_call_count=4, current_tool=None, last_activity_ts=1001.0)
+    with _REGISTRY.lock:
+        clock_before = record.progress_started_at
+    assert SubagentLifecycleService._sweep() == 0, "mode transition is activity: no interrupt"
+    with _REGISTRY.lock:
+        assert record.in_tool is False, "mode transition must be adopted on the next sweep"
+        assert record.progress_started_at > clock_before, "quiet clock must re-arm on the mode transition"
+    # Now idle past the request's 30s idle threshold: the monitor engages at the IDLE
+    # threshold, not the stale 1200s in-tool ceiling.
+    with _REGISTRY.lock:
+        record.progress_started_at = time.monotonic() - 35.0
+    assert SubagentLifecycleService._sweep() == 1
+    _await_child_interrupt(child)
+    assert child.interrupt_kind == "hard"
     release.set()
     lifecycle.wait(handle, timeout_seconds=5)
 

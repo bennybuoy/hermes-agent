@@ -367,6 +367,126 @@ def test_tool_exit_resampled_every_sweep_rearms_clock(lifecycle, monkeypatch):
     lifecycle.wait(handle, timeout_seconds=5)
 
 
+class MachineryChild(FakeChild):
+    """Fake child carrying the real AIAgent liveness seam: ``_liveness_activity_lock()``,
+    the generation counter, and the abort claim (the interrupt-control claim protocol)."""
+
+    def __init__(self, ident):
+        super().__init__(ident)
+        self._activity_lock = threading.Lock()
+        self._turn_liveness_activity_generation = 0
+        self._turn_liveness_abort_claim = None
+
+    def _liveness_activity_lock(self):
+        return self._activity_lock
+
+    def touch(self):
+        """Mirror ``_touch_activity``: bump generation, stamp, invalidate any reserved claim."""
+        with self._activity_lock:
+            self._turn_liveness_activity_generation += 1
+            self.activity_summary["last_activity_ts"] = time.time()
+            self._turn_liveness_abort_claim = None
+
+    def interrupt(self, message=None, *, hard_cancel=False, tool_reason=None, require_generation=None):
+        # Mirror InterruptControlMixin.interrupt: reserve the claim under the activity
+        # lock, consume it at the publication edge, decline when activity raced.
+        self.interrupt_message = message
+        self.tool_reason = tool_reason
+        if require_generation is not None:
+            with self._activity_lock:
+                if self._turn_liveness_activity_generation != require_generation:
+                    return False  # turn resumed before the claim was reserved
+                self._turn_liveness_abort_claim = require_generation
+            with self._activity_lock:
+                if self._turn_liveness_abort_claim != require_generation:
+                    return False
+                self._turn_liveness_abort_claim = None
+        self.interrupted = True
+        self.interrupt_kind = "claimed-hard" if hard_cancel else "claimed"
+        return True
+
+
+def _launch_machinery_record(lifecycle, monkeypatch, release):
+    """Launch with a MachineryChild and a blocked runner; returns (handle, record, child)."""
+    machinery = MachineryChild("sa-claim")
+    monkeypatch.setattr("tools.delegate_tool._build_child_agent", lambda **_kwargs: machinery)
+    monkeypatch.setattr("tools.delegate_tool._run_single_child", StalledRunner(release))
+    handle = lifecycle.launch(SubagentLaunchRequest(goal="claim probe", stall_timeout_seconds=30.0))
+    record = lifecycle._record(handle)
+    deadline = time.monotonic() + 5
+    while record.state is not SubagentState.RUNNING and time.monotonic() < deadline:
+        time.sleep(0.001)
+    return handle, record, machinery
+
+
+def _freeze_child_for_sweep(record, child):
+    """Freeze the child's summary AND backdate the record's quiet window past the 30s
+    idle threshold under the registry lock (the pre-sweep observation)."""
+    child.activity_summary.update(api_call_count=0, current_tool=None, last_activity_ts=1000.0)
+    with _REGISTRY.lock:
+        record.last_progress_token = (0, None, 1000.0)
+        record.progress_started_at = time.monotonic() - 45.0
+        record.in_tool = False
+
+
+def test_generation_claimed_interrupt_commits_when_activity_stays_quiet(lifecycle, monkeypatch):
+    # F2: with real liveness machinery the phase-1 interrupt is committed through the
+    # child's generation claim — hard-cancel published, tool_reason forwarded.
+    release = threading.Event()
+    handle, record, child = _launch_machinery_record(lifecycle, monkeypatch, release)
+    _freeze_child_for_sweep(record, child)
+    to_interrupt, _to_finalize, _ = SubagentLifecycleService._sweep_locked()
+    assert len(to_interrupt) == 1
+    assert SubagentLifecycleService._dispatch_stall_interrupt(record, 45.0, 30.0) is True
+    assert child.interrupt_kind == "claimed-hard"
+    assert child.tool_reason == "subagent stall interrupt requested"
+    with _REGISTRY.lock:
+        assert record.stall_interrupt_requested is True
+        assert record.stall_grace_deadline is not None
+    release.set()
+    lifecycle.wait(handle, timeout_seconds=5)
+
+
+def test_activity_resumed_before_interrupt_commit_aborts_and_clears_grace(lifecycle, monkeypatch):
+    # F2: activity resuming between the sweep commit and the interrupt dispatch abandons
+    # the abort — no interrupt, grace cleared, fresh sample adopted, clock re-armed.
+    release = threading.Event()
+    handle, record, child = _launch_machinery_record(lifecycle, monkeypatch, release)
+    _freeze_child_for_sweep(record, child)
+    to_interrupt, _to_finalize, _ = SubagentLifecycleService._sweep_locked()
+    assert len(to_interrupt) == 1
+    assert record.stall_grace_deadline is not None
+    # Activity resumes between the sweep commit and the interrupt dispatch.
+    child.touch()
+    child.activity_summary["api_call_count"] = 7
+    assert SubagentLifecycleService._dispatch_stall_interrupt(record, 45.0, 30.0) is False
+    assert child.interrupt_kind is None, "resumed child must never be interrupted"
+    with _REGISTRY.lock:
+        assert record.stall_grace_deadline is None, "aborted commit must clear the grace"
+        assert record.stall_quiet_seconds is None and record.stall_phase is None
+        assert record.last_progress_token == (7, None, child.activity_summary["last_activity_ts"]), "fresh sample adopted"
+        assert record.stall_interrupt_requested is False
+    release.set()
+    lifecycle.wait(handle, timeout_seconds=5)
+
+
+def test_fake_child_without_liveness_machinery_degrades_to_compat_interrupt(lifecycle, monkeypatch):
+    # F2: test doubles lacking the liveness seam keep the current compat hard-interrupt
+    # behavior (real AIAgent children always carry the machinery).
+    release = threading.Event()
+    handle, record = _make_record(lifecycle, monkeypatch=monkeypatch, release=release)
+    child = record.agent
+    deadline = time.monotonic() + 5
+    while record.state is not SubagentState.RUNNING and time.monotonic() < deadline:
+        time.sleep(0.001)
+    _freeze_child_for_sweep(record, child)
+    assert SubagentLifecycleService._sweep() == 1
+    _await_child_interrupt(child)
+    assert child.interrupt_kind == "hard", "no machinery: compat hard interrupt stands"
+    release.set()
+    lifecycle.wait(handle, timeout_seconds=5)
+
+
 def test_second_sweep_does_not_reinterrupt(lifecycle, monkeypatch):
     release = threading.Event()
     handle, record = _make_record(lifecycle, monkeypatch=monkeypatch, release=release)

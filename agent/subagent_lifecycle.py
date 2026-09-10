@@ -189,6 +189,10 @@ class _Record:
     stall_threshold_seconds: Optional[float] = None
     stall_phase: Optional[str] = None
     stall_interrupt_requested: bool = False
+    # Generation captured with the frozen sample (machinery children only): the
+    # interrupt dispatch passes it as ``require_generation`` so the child's own
+    # claim protocol can decline an interrupt that raced real activity.
+    stall_claim_generation: Optional[int] = None
     # Set by cancel(): the monitor's force-finalization must honour cancellation precedence.
     stall_cancel_precedence: bool = False
     terminal_event: threading.Event = dataclasses.field(default_factory=threading.Event)
@@ -454,50 +458,114 @@ class SubagentLifecycleService:
                     to_finalize.append((record, record.stall_quiet_seconds or 0.0,
                                         record.stall_threshold_seconds or _STALL_IN_TOOL_SECONDS))
                 continue
-            # Sample EVERY sweep BEFORE evaluating expiry: a frozen token keeps the
-            # quiet clock running, but a changed token — including a tool exit (a
-            # mode transition is itself activity) — re-arms the clock and switches
-            # the effective threshold, so the fixed in-tool ceiling never outlives
-            # the tool call that set it.
-            token, in_tool = _sample_child_progress(record.agent, previous=(record.last_progress_token, record.in_tool))
-            if token != record.last_progress_token:
-                record.last_progress_token, record.in_tool = token, in_tool
-                record.progress_started_at = now_mono
+            # Sample EVERY sweep BEFORE evaluating expiry (F1): a frozen token keeps
+            # the quiet clock running, but a changed token — including a tool exit (a
+            # mode transition is itself activity) — re-arms the clock and switches the
+            # effective threshold. Machinery children sample + reserve the abort claim
+            # under their activity lock (registry→activity ordering, same direction as
+            # _stamp_progress_locked) so stale-sample protection survives through
+            # interrupt commitment; the dispatch re-verifies the claim at its edge.
+            if SubagentLifecycleService._revalidate_child_sample(record):
                 continue  # fresh activity adopted: the clock re-armed
             quiet = max(0.0, now_mono - (record.progress_started_at or now_mono))
             threshold = _STALL_IN_TOOL_SECONDS if record.in_tool else record.request_stall_timeout_seconds
             if quiet < threshold:
                 continue
             record.stall_quiet_seconds, record.stall_threshold_seconds = quiet, threshold
-            record.stall_phase = "in_tool" if in_tool else "idle"
+            record.stall_phase = "in_tool" if record.in_tool else "idle"
             record.stall_grace_deadline = now_mono + _STALL_GRACE_SECONDS  # fixed from commit instant
             to_interrupt.append((record, quiet, threshold))
         return to_interrupt, to_finalize, any_monitorable
+
+    @staticmethod
+    def _revalidate_child_sample(record: _Record) -> bool:
+        """Re-sample the child EVERY sweep (F1), adopting fresh activity; for children
+        carrying the liveness seam the sample and the abort-claim context are taken under
+        the child's activity lock (mirrors interrupt_control's ``(generation, timestamp)``
+        binding). Returns True when a fresh sample was adopted (the clock re-armed)."""
+        agent = record.agent
+        lock_getter = getattr(agent, "_liveness_activity_lock", None)
+        if callable(lock_getter):
+            with lock_getter():
+                generation = getattr(agent, "_turn_liveness_activity_generation", 0)
+                token, in_tool = _sample_child_progress(agent, previous=(record.last_progress_token, record.in_tool))
+                if token != record.last_progress_token:
+                    record.last_progress_token, record.in_tool = token, in_tool
+                    record.progress_started_at = time.monotonic()
+                    return True  # fresh activity adopted: the clock re-armed
+                # Frozen: keep the generation the dispatch must claim against; a real
+                # ``_touch_activity`` between here and the interrupt commit bumps the
+                # generation and the child's interrupt declines the stale abort.
+                record.stall_claim_generation = generation
+                return False
+        token, in_tool = _sample_child_progress(agent, previous=(record.last_progress_token, record.in_tool))
+        if token != record.last_progress_token:
+            record.last_progress_token, record.in_tool = token, in_tool
+            record.progress_started_at = time.monotonic()
+            return True  # fresh activity adopted: the clock re-armed
+        return False
+
+    @staticmethod
+    def _dispatch_stall_interrupt(record: _Record, quiet: float, threshold: float) -> bool:
+        """Dispatch one phase-1 stall interrupt OUTSIDE the registry lock.
+
+        Real children (AIAgent) carry the liveness seam: the interrupt is committed through
+        ``interrupt(..., hard_cancel=True, require_generation=<generation sampled at sweep
+        time>)`` — the child's own claim protocol declines the abort when activity resumed
+        between the sweep's frozen observation and this commit, and the record's phase-1
+        bookkeeping is undone so the next sweep re-arms from the fresh sample. Test doubles
+        without the machinery keep the compat hard-interrupt path. Returns True when the
+        interrupt was committed."""
+        agent = record.agent
+        if agent is None:
+            return False
+        message = (
+            f"Lifecycle stall monitor: no child activity for {quiet:.0f}s "
+            f"(threshold {threshold:.0f}s); fixed grace {_STALL_GRACE_SECONDS:.0f}s before force-finalization.")
+        machinery = callable(getattr(agent, "_liveness_activity_lock", None))
+        try:
+            if machinery:
+                committed = bool(agent.interrupt(
+                    message, hard_cancel=True, tool_reason="subagent stall interrupt requested",
+                    require_generation=record.stall_claim_generation))
+            else:
+                committed = bool(_request_hard_interrupt(
+                    agent, message, tool_reason="subagent stall interrupt requested"))
+        except Exception:
+            # Mechanism failure keeps the old behavior: the grace window and the
+            # requested flag stand, and force-finalization remains the backstop.
+            committed = True
+        with _REGISTRY.lock:
+            if committed:
+                record.stall_interrupt_requested = True
+                record.stall_claim_generation = None
+            else:
+                # Claim declined — activity resumed between observation and commit.
+                # Undo the phase-1 commit and adopt the fresh sample under the same
+                # registry lock (sampling nests the child's activity lock, never the
+                # reverse), so the clock re-arms instead of finalizing a stale abort.
+                record.stall_grace_deadline = None
+                record.stall_quiet_seconds = None
+                record.stall_threshold_seconds = None
+                record.stall_phase = None
+                record.stall_interrupt_requested = False
+                record.stall_claim_generation = None
+                SubagentLifecycleService._revalidate_child_sample(record)
+        return committed
 
     @staticmethod
     def _sweep() -> int:
         """One two-phase monitor pass; returns the number of actions taken.
 
         Test/monitor seam: the monitor loop calls this every 30s; event-based tests drive it
-        directly instead of sleeping. Hard interrupts are requested OUTSIDE the registry lock
-        so a blocking interrupt cannot stall other records' deadlines."""
+        directly instead of sleeping. Interrupts are dispatched OUTSIDE the registry lock so
+        a blocking interrupt cannot stall other records' deadlines."""
         with _REGISTRY.lock:
             to_interrupt, to_finalize, _ = SubagentLifecycleService._sweep_locked()
         actions = 0
         for record, quiet, threshold in to_interrupt:
-            agent = record.agent
-            if agent is None:
-                continue
-            with contextlib.suppress(Exception):
-                _request_hard_interrupt(
-                    agent,
-                    f"Lifecycle stall monitor: no child activity for {quiet:.0f}s "
-                    f"(threshold {threshold:.0f}s); fixed grace {_STALL_GRACE_SECONDS:.0f}s before force-finalization.",
-                    tool_reason="subagent stall interrupt requested",
-                )
-            with _REGISTRY.lock:
-                record.stall_interrupt_requested = True
-            actions += 1
+            if SubagentLifecycleService._dispatch_stall_interrupt(record, quiet, threshold):
+                actions += 1
         for record, quiet, threshold in to_finalize:
             actions += SubagentLifecycleService._force_finalize_stalled(record, quiet, threshold)
         return actions

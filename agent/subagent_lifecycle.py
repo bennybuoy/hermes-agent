@@ -30,6 +30,21 @@ _TERMINAL_RETENTION_SECONDS = 3_600
 # Herald-parity floor for the opt-in inactivity watchdog; lower values are rejected at launch.
 _STALL_TIMEOUT_MIN_SECONDS = 30.0
 
+# ── Two-phase stall monitor (ported from tools/async_delegation.py) ─────────
+# A runner wedged before returning never reaches its terminal publication, so the record
+# would stay RUNNING forever. No wall-clock timeout (heavy work must never be killed for
+# taking long): one lazily-started monitor thread samples per-record PROGRESS via the
+# structured ``(api_call_count, current_tool, last_activity_ts)`` token; a child frozen
+# past the idle threshold (or the fixed in-tool ceiling) is hard-interrupted and given a
+# FIXED grace window to unwind via the normal completion path; a record still unreturned
+# after grace is force-finalized with a terminal FAILED/STALLED result. This is a
+# liveness watchdog, not a progress detector: a stuck provider request with a functioning
+# heartbeat stays "alive" to it; transport watchdogs and configured delegation timeouts
+# remain independently effective.
+_STALL_SWEEP_SECONDS = 30.0
+_STALL_GRACE_SECONDS = 120.0
+_STALL_IN_TOOL_SECONDS = 1200.0
+
 
 class SubagentLifecycleError(ValueError):
     """A request cannot be safely accepted by the public lifecycle API."""
@@ -126,6 +141,10 @@ class SubagentResult:
     error_message: Optional[str] = None
     usage_metadata: Mapping[str, Any] = dataclasses.field(default_factory=dict)
     tool_execution_summary: Mapping[str, Any] = dataclasses.field(default_factory=dict)
+    # Additive, present only on stall finalizations (flat strings/numbers; kept immutable
+    # so mutability never leaks into the frozen result). ``result_hash`` stays an opaque
+    # versioned integrity token — do not test cross-version equality.
+    stall_metadata: Mapping[str, Any] = dataclasses.field(default_factory=dict)
     result_hash: Optional[str] = None
 
 
@@ -150,10 +169,15 @@ class _Record:
     # progress sample, the monotonic instant it was first observed, whether the
     # child was inside a tool at sample time, and the fixed post-interrupt grace
     # deadline. All are read/written under _REGISTRY.lock.
+    request_stall_timeout_seconds: Optional[float] = None
     last_progress_token: Optional[tuple] = None
     progress_started_at: Optional[float] = None
     in_tool: bool = False
     stall_grace_deadline: Optional[float] = None
+    stall_quiet_seconds: Optional[float] = None
+    stall_threshold_seconds: Optional[float] = None
+    stall_phase: Optional[str] = None
+    stall_interrupt_requested: bool = False
     terminal_event: threading.Event = dataclasses.field(default_factory=threading.Event)
 
 
@@ -164,9 +188,69 @@ class _Registry:
     lock: threading.RLock = dataclasses.field(default_factory=threading.RLock)
     records: dict[str, _Record] = dataclasses.field(default_factory=dict)
     correlations: dict[tuple[Optional[str], str], str] = dataclasses.field(default_factory=dict)
+    # Stall-monitor lifecycle: start/exit synchronized under ``lock`` with a generation
+    # counter so a racing launch either sees an alive monitor or starts one.
+    monitor_thread: Optional[threading.Thread] = None
+    monitor_owner_generation: int = 0
+    monitor_generation: int = 0
+    monitor_wake: threading.Event = dataclasses.field(default_factory=threading.Event)
 
 
 _REGISTRY = _Registry()
+
+
+def _ensure_stall_monitor() -> None:
+    """Start the stall monitor if any record carries a stall policy.
+
+    The start decision is synchronized under ``_REGISTRY.lock`` with a generation counter:
+    a launch either sees the CURRENT generation's monitor alive or bumps the generation and
+    starts a new thread — even a live-but-superseded thread never blocks re-arming, so a
+    launch racing a monitor's final empty sweep can never strand its record.
+    """
+    with _REGISTRY.lock:
+        if not any(record.request_stall_timeout_seconds is not None for record in _REGISTRY.records.values()):
+            return
+        thread = _REGISTRY.monitor_thread
+        if thread is not None and thread.is_alive() and _REGISTRY.monitor_owner_generation == _REGISTRY.monitor_generation:
+            return
+        _REGISTRY.monitor_generation += 1
+        generation = _REGISTRY.monitor_generation
+        _REGISTRY.monitor_owner_generation = generation
+        thread = threading.Thread(
+            target=_stall_monitor_loop, args=(generation,), name="hermes-lifecycle-stall-monitor", daemon=True)
+        _REGISTRY.monitor_thread = thread
+    thread.start()
+
+
+def _stall_monitor_loop(generation: int) -> None:
+    """Sweep stall-capable records, then wait one sweep interval (30s) or a launch wake.
+
+    Exits — under ``_REGISTRY.lock`` — when its generation was superseded by a newer monitor
+    or a synchronized sweep finds nothing monitorable, clearing the slot it owns."""
+    while True:
+        SubagentLifecycleService._sweep()
+        with _REGISTRY.lock:
+            if _REGISTRY.monitor_owner_generation != generation:
+                return  # superseded: a newer generation's thread owns the slot
+            if not any(record.request_stall_timeout_seconds is not None and record.result is None
+                       for record in _REGISTRY.records.values()):
+                _REGISTRY.monitor_thread = None
+                return
+        if _REGISTRY.monitor_wake.wait(_STALL_SWEEP_SECONDS):
+            _REGISTRY.monitor_wake.clear()
+
+
+from agent.interrupt_compat import request_hard_interrupt as _request_hard_interrupt
+
+
+def _stall_metadata(record: _Record, quiet_seconds: float, threshold: float) -> dict[str, Any]:
+    """Structured stall metadata — additive, present only on stall finalizations."""
+    return {
+        "stalled_after_quiet_seconds": round(quiet_seconds, 2),
+        "stall_threshold_seconds": threshold,
+        "stall_phase": "in_tool" if record.in_tool else "idle",
+        "stall_grace_seconds": _STALL_GRACE_SECONDS,
+    }
 from tools.daemon_pool import DaemonThreadPoolExecutor as _DaemonExecutor  # daemon: a wedged child never blocks exit
 _EXECUTOR = _DaemonExecutor(max_workers=8, thread_name_prefix="hermes-lifecycle")
 _SECRET = secrets.token_bytes(32)
@@ -301,12 +385,16 @@ class SubagentLifecycleService:
             getattr(child, "provider", None), getattr(child, "model", None), getattr(child, "_delegate_role", request.role),
             int(getattr(child, "_delegate_depth", 1) or 1), self._capability(subagent_id, parent_session_id, created),
         )
-        record = _Record(handle, SubagentState.PENDING, created, agent=child)
+        record = _Record(handle, SubagentState.PENDING, created, agent=child,
+                         request_stall_timeout_seconds=request.stall_timeout_seconds)
         with _REGISTRY.lock:
             _REGISTRY.records[subagent_id] = record
             if request.correlation_id:
                 _REGISTRY.correlations[correlation_key] = subagent_id
         record.future = _EXECUTOR.submit(self._run, record, request.goal, parent)
+        if request.stall_timeout_seconds is not None:
+            _ensure_stall_monitor()
+            _REGISTRY.monitor_wake.set()
         return handle
 
     @staticmethod
@@ -317,12 +405,148 @@ class SubagentLifecycleService:
         record.last_progress_token, record.in_tool = token, in_tool
         record.progress_started_at = time.monotonic()
 
+    @staticmethod
+    def _sweep_locked() -> tuple[list, list, bool]:
+        """Collect two-phase stall actions; caller holds ``_REGISTRY.lock``.
+
+        Phase 1 candidates: records whose frozen sample stayed frozen past the effective
+        threshold (idle = the request's ``stall_timeout_seconds``; in-tool = the FIXED
+        ``_STALL_IN_TOOL_SECONDS``, regardless of the request). Each candidate is REVALIDATED
+        here — the token is re-sampled under the lock, and a child that resumed since the
+        observation is adopted as fresh instead of interrupted (stale-sample abort, mirroring
+        the activity-tracking abort-claim pattern). Committing marks the record stalling with
+        a FIXED grace deadline; the interrupt itself is requested by the caller OUTSIDE the
+        lock. Phase 2 candidates: stalling records whose fixed grace expired — activity during
+        grace never resets it. Queued (never-started) records are monitorable but not charged
+        inactivity. Records without a stall policy are never monitor-engaged. Returns
+        ``(interrupts, finalizes, any_monitorable)``.
+        """
+        now_mono = time.monotonic()
+        to_interrupt: list[tuple[_Record, float, float]] = []  # (record, quiet_seconds, threshold)
+        to_finalize: list[tuple[_Record, float, float]] = []
+        any_monitorable = False
+        for record in _REGISTRY.records.values():
+            if record.request_stall_timeout_seconds is None:
+                continue  # no policy on the request: never monitor-engaged
+            if record.result is not None:
+                continue  # already terminal
+            any_monitorable = True
+            if record.state is SubagentState.PENDING:
+                continue  # queued behind the pool: monitorable, but inactivity is not charged
+            if record.stall_grace_deadline is not None:
+                # Phase 2: grace is fixed — a re-sample here could look like recovery the
+                # instant the interruption itself triggers activity, so none is taken.
+                if now_mono >= record.stall_grace_deadline:
+                    to_finalize.append((record, record.stall_quiet_seconds or 0.0,
+                                        record.stall_threshold_seconds or _STALL_IN_TOOL_SECONDS))
+                continue
+            quiet = max(0.0, now_mono - (record.progress_started_at or now_mono))
+            threshold = _STALL_IN_TOOL_SECONDS if record.in_tool else record.request_stall_timeout_seconds
+            if quiet < threshold:
+                continue
+            # Revalidate the frozen observation before committing the interrupt.
+            token, in_tool = _sample_child_progress(record.agent, previous=(record.last_progress_token, record.in_tool))
+            if token != record.last_progress_token:
+                record.last_progress_token, record.in_tool = token, in_tool
+                record.progress_started_at = now_mono
+                continue  # activity resumed between observation and commit: abort
+            record.stall_quiet_seconds, record.stall_threshold_seconds = quiet, threshold
+            record.stall_phase = "in_tool" if in_tool else "idle"
+            record.stall_grace_deadline = now_mono + _STALL_GRACE_SECONDS  # fixed from commit instant
+            to_interrupt.append((record, quiet, threshold))
+        return to_interrupt, to_finalize, any_monitorable
+
+    @staticmethod
+    def _sweep() -> int:
+        """One two-phase monitor pass; returns the number of actions taken.
+
+        Test/monitor seam: the monitor loop calls this every 30s; event-based tests drive it
+        directly instead of sleeping. Hard interrupts are requested OUTSIDE the registry lock
+        so a blocking interrupt cannot stall other records' deadlines."""
+        with _REGISTRY.lock:
+            to_interrupt, to_finalize, _ = SubagentLifecycleService._sweep_locked()
+        actions = 0
+        for record, quiet, threshold in to_interrupt:
+            agent = record.agent
+            if agent is None:
+                continue
+            with contextlib.suppress(Exception):
+                _request_hard_interrupt(
+                    agent,
+                    f"Lifecycle stall monitor: no child activity for {quiet:.0f}s "
+                    f"(threshold {threshold:.0f}s); fixed grace {_STALL_GRACE_SECONDS:.0f}s before force-finalization.",
+                    tool_reason="subagent stall interrupt requested",
+                )
+            with _REGISTRY.lock:
+                record.stall_interrupt_requested = True
+            actions += 1
+        for record, quiet, threshold in to_finalize:
+            actions += SubagentLifecycleService._force_finalize_stalled(record, quiet, threshold)
+        return actions
+
+    @staticmethod
+    def _force_finalize_stalled(record: _Record, quiet_seconds: float, threshold: float) -> int:
+        """Terminal FAILED/STALLED publication for a record whose fixed grace expired."""
+        error_message = (
+            f"Subagent {record.handle.subagent_id} stalled: the child stopped making progress "
+            "(no new API calls, tool transitions, or streamed tokens), did not respond to "
+            "interruption within the grace window, and never returned. The worker may be wedged "
+            "inside a model API call; transport watchdogs and configured delegation timeouts "
+            "remain independently effective. Re-dispatch the task if it is still needed.")
+        result = SubagentLifecycleService._with_result_hash(SubagentResult(
+            record.handle, SubagentState.FAILED, True, summary=None,
+            error_classification="STALLED", error_message=error_message,
+            started_at=record.started_at, completed_at=time.time(),
+            stall_metadata=_stall_metadata(record, quiet_seconds, threshold),
+        ))
+        return 1 if SubagentLifecycleService._publish_terminal(record, result) else 0
+
+    @staticmethod
+    def _publish_terminal(record: _Record, result: SubagentResult) -> bool:
+        """Single-writer terminal publication: under ``_REGISTRY.lock``, the FIRST publication
+        owns ``agent``/``result``/``state``/``completed_at``/``updated_at`` and sets the
+        record's ``terminal_event``; later publications (a late runner return after
+        force-finalization) change none of them. Never completes the executor-owned Future."""
+        with _REGISTRY.lock:
+            if record.result is not None:
+                return False
+            record.agent, record.result, record.state = None, result, result.terminal_state
+            record.completed_at = record.updated_at = result.completed_at or time.time()
+            record.terminal_event.set()
+            return True
+
+    @staticmethod
+    def _with_result_hash(result: SubagentResult) -> SubagentResult:
+        payload = dataclasses.asdict(result)
+        payload.pop("result_hash", None)
+        return dataclasses.replace(
+            result, result_hash=hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest())
+
     def status(self, handle: SubagentHandle) -> SubagentStatus:
         record = self._record(handle)
         if record is None:
             return SubagentStatus(handle, SubagentState.UNKNOWN, time.time(), "UNKNOWN_HANDLE")
         with _REGISTRY.lock:
-            return SubagentStatus(record.handle, record.state, record.updated_at)
+            diagnostic = None
+            if record.stall_grace_deadline is not None:
+                # Phase-2/grace diagnostic; the metadata ``stall_phase`` keeps its
+                # async-delegation meaning (idle|in_tool), never phase 1/2.
+                remaining = max(0.0, record.stall_grace_deadline - time.monotonic())
+                mode = record.stall_phase or ("in_tool" if record.in_tool else "idle")
+                diagnostic = (
+                    f"stall interrupt requested: quiet={record.stall_quiet_seconds or 0.0:.0f}s "
+                    f"threshold={record.stall_threshold_seconds or 0.0:.0f}s mode={mode} "
+                    f"grace={_STALL_GRACE_SECONDS:.0f}s (force-finalize in ~{remaining:.0f}s)")
+            elif record.stall_interrupt_requested:
+                mode = record.stall_phase or ("in_tool" if record.in_tool else "idle")
+                diagnostic = (
+                    f"stall interrupt requested: quiet={record.stall_quiet_seconds or 0.0:.0f}s "
+                    f"threshold={record.stall_threshold_seconds or 0.0:.0f}s mode={mode} "
+                    f"grace={_STALL_GRACE_SECONDS:.0f}s")
+            elif record.request_stall_timeout_seconds is not None and record.state is not SubagentState.PENDING:
+                diagnostic = (f"stall monitor armed: threshold={record.request_stall_timeout_seconds:.0f}s "
+                              f"(idle), in-tool ceiling={_STALL_IN_TOOL_SECONDS:.0f}s")
+            return SubagentStatus(record.handle, record.state, record.updated_at, diagnostic)
 
     def wait(self, handle: SubagentHandle, *, timeout_seconds: Optional[float] = None) -> SubagentTerminalState:
         record = self._record(handle)
@@ -421,12 +645,9 @@ class SubagentLifecycleService:
             state = SubagentState.FAILED
             fields = dict(error_classification=type(exc).__name__, error_message=_clip(exc))
         result = SubagentResult(record.handle, state, True, started_at=record.started_at, completed_at=time.time(), **fields)
-        payload = dataclasses.asdict(result)
-        payload.pop("result_hash", None)
-        result = dataclasses.replace(result, result_hash=hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest())
-        with _REGISTRY.lock:
-            record.agent, record.result, record.state = None, result, result.terminal_state
-            record.completed_at = record.updated_at = result.completed_at
+        result = SubagentLifecycleService._with_result_hash(result)
+        # Single-writer publication: a force-finalized record ignores this late return.
+        SubagentLifecycleService._publish_terminal(record, result)
 
     @staticmethod
     def _capability(subagent_id: str, parent_session_id: Optional[str], created_at: float) -> str:

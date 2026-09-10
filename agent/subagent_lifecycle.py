@@ -558,17 +558,42 @@ class SubagentLifecycleService:
         """One two-phase monitor pass; returns the number of actions taken.
 
         Test/monitor seam: the monitor loop calls this every 30s; event-based tests drive it
-        directly instead of sleeping. Interrupts are dispatched OUTSIDE the registry lock so
-        a blocking interrupt cannot stall other records' deadlines."""
+        directly instead of sleeping. Interrupts run on short-lived daemon threads (tracked
+        in flight so a record is never re-interrupted while one is running) so a blocked
+        interrupt cannot stall other records' sweeps or finalizations; finalization never
+        queues behind interrupts."""
         with _REGISTRY.lock:
             to_interrupt, to_finalize, _ = SubagentLifecycleService._sweep_locked()
         actions = 0
         for record, quiet, threshold in to_interrupt:
-            if SubagentLifecycleService._dispatch_stall_interrupt(record, quiet, threshold):
+            if SubagentLifecycleService._spawn_interrupt_thread(record, quiet, threshold):
                 actions += 1
         for record, quiet, threshold in to_finalize:
             actions += SubagentLifecycleService._force_finalize_stalled(record, quiet, threshold)
         return actions
+
+    _INTERRUPT_THREADS_LOCK = threading.Lock()
+    _INTERRUPT_THREADS: dict = {}
+
+    @staticmethod
+    def _spawn_interrupt_thread(record: _Record, quiet: float, threshold: float) -> bool:
+        """Start a short-lived daemon thread for one interrupt and track it in flight so
+        the monitor never re-spawns an interrupt for the same record while one is running."""
+        record_id = record.handle.subagent_id
+        with SubagentLifecycleService._INTERRUPT_THREADS_LOCK:
+            if record_id in SubagentLifecycleService._INTERRUPT_THREADS:
+                return False  # an interrupt is already in flight for this record
+            SubagentLifecycleService._INTERRUPT_THREADS[record_id] = True
+
+        def _run() -> None:
+            try:
+                SubagentLifecycleService._dispatch_stall_interrupt(record, quiet, threshold)
+            finally:
+                with SubagentLifecycleService._INTERRUPT_THREADS_LOCK:
+                    SubagentLifecycleService._INTERRUPT_THREADS.pop(record_id, None)
+
+        threading.Thread(target=_run, name="hermes-lifecycle-stall-interrupt", daemon=True).start()
+        return True
 
     @staticmethod
     def _force_finalize_stalled(record: _Record, quiet_seconds: float, threshold: float) -> int:

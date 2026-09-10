@@ -487,6 +487,89 @@ def test_fake_child_without_liveness_machinery_degrades_to_compat_interrupt(life
     lifecycle.wait(handle, timeout_seconds=5)
 
 
+def test_blocked_interrupt_does_not_block_finalization(lifecycle, monkeypatch):
+    # F3: a blocked interrupt must never freeze supervision — a second record whose grace
+    # expires publishes WHILE the first record's interrupt is still blocked.
+    release_a = threading.Event()
+    handle_a, record_a = _make_record(lifecycle, monkeypatch=monkeypatch, release=release_a)
+    child_a = record_a.agent
+    deadline = time.monotonic() + 5
+    while record_a.state is not SubagentState.RUNNING and time.monotonic() < deadline:
+        time.sleep(0.001)
+    _freeze_child_for_sweep(record_a, child_a)
+    release_b = threading.Event()
+    blocker = threading.Event()
+    child_b = FakeChild("sa-blocker")
+    monkeypatch.setattr("tools.delegate_tool._build_child_agent", lambda **_kwargs: child_b)
+    monkeypatch.setattr("tools.delegate_tool._run_single_child", StalledRunner(release_b))
+
+    def blocking_hard_interrupt(reason, *, tool_reason=None):
+        blocker.wait(10)  # wedged interrupt: never returns until released
+
+    child_b.hard_interrupt = blocking_hard_interrupt
+    handle_b = lifecycle.launch(SubagentLaunchRequest(goal="second record", stall_timeout_seconds=30.0))
+    record_b = lifecycle._record(handle_b)
+    deadline = time.monotonic() + 5
+    while record_b.state is not SubagentState.RUNNING and time.monotonic() < deadline:
+        time.sleep(0.001)
+    _freeze_child_for_sweep(record_b, child_b)
+    # First sweep: both records freeze past threshold → two in-flight interrupt threads;
+    # A commits (interrupt observed), B's interrupt is wedged inside hard_interrupt.
+    assert SubagentLifecycleService._sweep() == 2
+    _await_child_interrupt(child_a)
+    with _REGISTRY.lock:
+        deadline_b = record_b.stall_grace_deadline
+    assert deadline_b is not None
+    # Second sweep: A stays in grace, B's grace expires → force-finalize must run (B's
+    # in-flight interrupt must not block it), and neither record is re-interrupted.
+    with _REGISTRY.lock:
+        record_b.stall_grace_deadline = time.monotonic() - 1.0
+    assert SubagentLifecycleService._sweep() == 1, "B force-finalizes while B's interrupt is in flight"
+    result_b = lifecycle.result(handle_b)
+    assert result_b.terminal_state is SubagentState.FAILED
+    assert result_b.error_classification == "STALLED"
+    # A's interrupt never blocked any of this; release everything and drain.
+    blocker.set()
+    release_b.set()
+    release_a.set()
+    lifecycle.wait(handle_a, timeout_seconds=5)
+    lifecycle.wait(handle_b, timeout_seconds=5)
+
+
+def test_sweep_does_not_respawn_in_flight_interrupt(lifecycle, monkeypatch):
+    # F3: the monitor never re-spawns an interrupt for a record while one is in flight;
+    # the in-flight entry clears when the interrupt thread completes.
+    release = threading.Event()
+    handle, record = _make_record(lifecycle, monkeypatch=monkeypatch, release=release)
+    child = record.agent
+    deadline = time.monotonic() + 5
+    while record.state is not SubagentState.RUNNING and time.monotonic() < deadline:
+        time.sleep(0.001)
+    _freeze_child_for_sweep(record, child)
+    blocker = threading.Event()
+
+    def blocking_hard_interrupt(reason, *, tool_reason=None):
+        blocker.wait(10)
+
+    child.hard_interrupt = blocking_hard_interrupt
+    assert SubagentLifecycleService._sweep() == 1, "first sweep spawns the interrupt"
+    record_id = record.handle.subagent_id
+    deadline = time.monotonic() + 5
+    while record_id not in SubagentLifecycleService._INTERRUPT_THREADS and time.monotonic() < deadline:
+        time.sleep(0.001)
+    assert record_id in SubagentLifecycleService._INTERRUPT_THREADS, "in-flight entry present while blocked"
+    # Second sweep while the interrupt is wedged: no re-spawn (sweep takes 0 actions).
+    assert SubagentLifecycleService._sweep() == 0
+    assert SubagentLifecycleService._INTERRUPT_THREADS[record_id] is not None
+    blocker.set()
+    release.set()
+    lifecycle.wait(handle, timeout_seconds=5)
+    deadline = time.monotonic() + 5
+    while record_id in SubagentLifecycleService._INTERRUPT_THREADS and time.monotonic() < deadline:
+        time.sleep(0.001)
+    assert record_id not in SubagentLifecycleService._INTERRUPT_THREADS, "entry clears when the thread completes"
+
+
 def test_second_sweep_does_not_reinterrupt(lifecycle, monkeypatch):
     release = threading.Event()
     handle, record = _make_record(lifecycle, monkeypatch=monkeypatch, release=release)

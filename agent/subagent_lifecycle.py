@@ -631,12 +631,46 @@ class SubagentLifecycleService:
         """Single-writer terminal publication: under ``_REGISTRY.lock``, the FIRST publication
         owns ``agent``/``result``/``state``/``completed_at``/``updated_at`` and sets the
         record's ``terminal_event``; later publications (a late runner return after
-        force-finalization) change none of them. Never completes the executor-owned Future."""
+        force-finalization) change none of it. Never completes the executor-owned Future.
+
+        Cancellation precedence and stall causality are resolved ATOMICALLY here under the
+        same registry lock (F4): the record's state is re-read at publication time, never
+        trusted from the caller's stale snapshot."""
         with _REGISTRY.lock:
             if record.result is not None:
                 return False
-            record.agent, record.result, record.state = None, result, result.terminal_state
-            record.completed_at = record.updated_at = result.completed_at or time.time()
+            resolved = result
+            if (result.terminal_state is SubagentState.INTERRUPTED
+                    and record.state is SubagentState.CANCEL_REQUESTED):
+                # Cancellation landed after the runner classified its return: the explicit
+                # cancel wins — republish as CANCELLED at the publication edge.
+                resolved = dataclasses.replace(
+                    result, terminal_state=SubagentState.CANCELLED,
+                    error_classification="CANCELLED",
+                    error_message=(
+                        f"Subagent {record.handle.subagent_id} was cancelled while returning: "
+                        "the explicit cancellation wins over the interruption classification."))
+                resolved = SubagentLifecycleService._with_result_hash(resolved)
+            elif (result.terminal_state is SubagentState.INTERRUPTED
+                    and record.stall_interrupt_requested
+                    and record.stall_quiet_seconds is not None
+                    and not record.stall_cancel_precedence):
+                # The stall monitor interrupted this child and the runner returned
+                # cooperatively: keep the stall causality (FAILED + STALLED + metadata)
+                # instead of a bare INTERRUPTED with empty metadata.
+                resolved = dataclasses.replace(
+                    result, terminal_state=SubagentState.FAILED,
+                    error_classification="STALLED",
+                    error_message=(
+                        f"Subagent {record.handle.subagent_id} stalled: the child stopped making progress "
+                        "(no new API calls, tool transitions, or streamed tokens), was interrupted by the "
+                        "stall monitor, and returned cooperatively within the grace window."),
+                    stall_metadata=_stall_metadata(
+                        record, record.stall_quiet_seconds or 0.0,
+                        record.stall_threshold_seconds or record.request_stall_timeout_seconds or _STALL_IN_TOOL_SECONDS))
+                resolved = SubagentLifecycleService._with_result_hash(resolved)
+            record.agent, record.result, record.state = None, resolved, resolved.terminal_state
+            record.completed_at = record.updated_at = resolved.completed_at or time.time()
             record.terminal_event.set()
             return True
 

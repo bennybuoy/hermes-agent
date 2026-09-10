@@ -570,6 +570,74 @@ def test_sweep_does_not_respawn_in_flight_interrupt(lifecycle, monkeypatch):
     assert record_id not in SubagentLifecycleService._INTERRUPT_THREADS, "entry clears when the thread completes"
 
 
+def _cooperative_interrupt_runner(timeout: float = 5.0):
+    """Runner that returns ``interrupted`` only after the child observes an interrupt."""
+    def runner(_i, _g, child, _p):
+        deadline = time.monotonic() + timeout
+        while not getattr(child, "interrupted", False) and time.monotonic() < deadline:
+            time.sleep(0.001)
+        return {"status": "interrupted", "summary": None, "api_calls": 3, "duration_seconds": 1.0}
+    return runner
+
+
+def _await_stall_flag(record, timeout: float = 5.0) -> None:
+    deadline = time.monotonic() + timeout
+    while not record.stall_interrupt_requested:
+        if time.monotonic() >= deadline:
+            pytest.fail("stall interrupt was never marked requested")
+        time.sleep(0.001)
+
+
+def test_stall_caused_cooperative_return_publishes_failed_stalled(lifecycle, monkeypatch):
+    # F4b: a stall-induced cooperative return keeps its causality — FAILED + STALLED +
+    # stall metadata at publication, not a bare INTERRUPTED with empty metadata.
+    monkeypatch.setattr("tools.delegate_tool._run_single_child", _cooperative_interrupt_runner())
+    handle, record = _make_record(lifecycle)
+    child = record.agent
+    deadline = time.monotonic() + 5
+    while record.state is not SubagentState.RUNNING and time.monotonic() < deadline:
+        time.sleep(0.001)
+    _freeze_child_for_sweep(record, child)
+    assert SubagentLifecycleService._sweep() == 1
+    _await_child_interrupt(child)
+    _await_stall_flag(record)
+    terminal = lifecycle.wait(handle, timeout_seconds=5)
+    assert terminal.state is SubagentState.FAILED
+    result = lifecycle.result(handle)
+    assert result.error_classification == "STALLED"
+    assert result.stall_metadata["stalled_after_quiet_seconds"] >= 44.0
+    assert result.stall_metadata["stall_threshold_seconds"] == 30.0
+    assert result.stall_metadata["stall_phase"] == "idle"
+
+
+def test_cancel_landing_before_publication_wins_over_stall_return(lifecycle, monkeypatch):
+    # F4a: publication-time state re-read — a cancel() landing between the runner's
+    # result construction and _publish_terminal must win (CANCELLED), never publish a
+    # stall/INTERRUPTED classification built from a stale snapshot.
+    monkeypatch.setattr("tools.delegate_tool._run_single_child", _cooperative_interrupt_runner())
+    handle, record = _make_record(lifecycle)
+    child = record.agent
+    deadline = time.monotonic() + 5
+    while record.state is not SubagentState.RUNNING and time.monotonic() < deadline:
+        time.sleep(0.001)
+    _freeze_child_for_sweep(record, child)
+    assert SubagentLifecycleService._sweep() == 1
+    _await_child_interrupt(child)
+    original_hash = SubagentLifecycleService._with_result_hash
+
+    def hash_then_cancel(result):
+        hashed = original_hash(result)
+        lifecycle.cancel(handle, reason="landed mid-publish")
+        return hashed
+
+    monkeypatch.setattr(SubagentLifecycleService, "_with_result_hash", staticmethod(hash_then_cancel))
+    terminal = lifecycle.wait(handle, timeout_seconds=5)
+    assert terminal.state is SubagentState.CANCELLED
+    result = lifecycle.result(handle)
+    assert result.error_classification == "CANCELLED"
+    assert result.terminal_state is SubagentState.CANCELLED
+
+
 def test_second_sweep_does_not_reinterrupt(lifecycle, monkeypatch):
     release = threading.Event()
     handle, record = _make_record(lifecycle, monkeypatch=monkeypatch, release=release)

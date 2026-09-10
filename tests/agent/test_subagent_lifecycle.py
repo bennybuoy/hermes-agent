@@ -1036,4 +1036,3 @@ def test_blocked_runner_consumes_executor_worker_after_force_finalize(monkeypatc
     assert starved, "blocked runner starves subsequent launches on a saturated executor"
     blocked.set()
     wedge.shutdown(wait=False)
-
